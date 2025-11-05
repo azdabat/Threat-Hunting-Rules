@@ -1,0 +1,193 @@
+// ====================================================================
+// L3 Native Hunt: DLL Sideloading (+ Fast & Dormant Loads, Drivers, Reg-Persist)
+// No TI, no externals — pure MDE/M365D native telemetry
+// Author: Ala Dabat
+// ====================================================================
+
+// ---- Tunables ----
+let lookback = 14d;                 // hunt window
+let prevalenceWindow = 90d;         // org rarity window
+let fastLoadSec = 300;              // ≤5 min create→load = FAST
+let dormantShortSec = 86400;        // 5 min–24h
+let dormantLongSec = 7d;            // 1–7 days
+let dormantVeryLongSec = 30d;       // >7–30 days
+// Optional scope (comment to run org-wide)
+// let targetHost = "FIN-LAP-024";
+
+// ---- Local allow/interest lists (replace w/ watchlists in prod) ----
+let TrustedPublishers = dynamic(["Microsoft Corporation","Microsoft Windows","Google LLC","Mozilla Corporation"]);
+let KnownGoodProcs    = dynamic(["msiexec.exe","svchost.exe","sppsvc.exe","TiWorker.exe"]);
+let SensitiveVendors  = dynamic(["3cx.exe","SolarWinds.BusinessLayerHost.exe","vendor.exe"]); // expand per org
+
+// ---- Org prevalence (rarity of file hash across estate) ----
+let OrgPrevalence =
+DeviceFileEvents
+| where Timestamp >= ago(prevalenceWindow)
+| summarize SeenDeviceCount=dcount(DeviceId), FirstSeen=min(Timestamp), LastSeen=max(Timestamp) by SHA256, FileName;
+
+// ---- DLL image-loads --------------------------------------------------------
+let DllImageLoads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where ImageFileName endswith ".dll"
+// | where DeviceName =~ targetHost   // optional scope
+| project
+    ImageLoadTime = Timestamp,
+    DeviceId, DeviceName,
+    LoaderProc = ProcessFileName,
+    LoaderPID  = ProcessId,
+    ImageFileName = FileName,
+    ImageSHA256  = coalesce(SHA256, tostring(ImageHash)),
+    SignatureStatus, Signer;
+
+// ---- DLL creations (to compute create→load latency) -------------------------
+let DllCreates =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".dll"
+| project
+    FileCreateTime = Timestamp,
+    DeviceId, DeviceName,
+    FileName, FolderPath,
+    FileSHA256 = SHA256,
+    InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessSigner;
+
+// ---- Driver (.sys) drops near DLL load -------------------------------------
+let SysDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where FileName endswith ".sys"
+   or FolderPath has_any (dynamic(["\\drivers\\","\\system32\\drivers\\"]))
+| project
+    DriverTime = Timestamp,
+    DeviceId, DeviceName,
+    SysFile = FileName,
+    SysSHA256 = SHA256,
+    SysFolder = FolderPath,
+    SysInitiator = InitiatingProcessFileName, SysCmd = InitiatingProcessCommandLine, SysSigner = InitiatingProcessSigner;
+
+// ---- Registry persistence correlation --------------------------------------
+let PersistenceKeys = dynamic([
+  @"HKLM\Software\Microsoft\Windows\CurrentVersion\Run", @"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+  @"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce", @"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+  @"HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components",
+  @"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Userinit",
+  @"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell",
+  @"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Windows\AppInit_DLLs",
+  @"HKLM\SYSTEM\CurrentControlSet\Services",
+  @"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+  @"HKCU\Software\Classes\CLSID", @"HKLM\Software\Classes\CLSID",
+  @"HKLM\SYSTEM\CurrentControlSet\Control\Lsa"
+]);
+let RegPersist =
+DeviceRegistryEvents
+| where Timestamp >= ago(lookback)
+| where ActionType == "RegistryValueSet"
+| where RegistryKey has_any (PersistenceKeys)
+| project RegTime = Timestamp, DeviceId, DeviceName, RegistryKey, RegistryValueName, RegistryValueData;
+
+// ---- Lightweight network context (no TI) -----------------------------------
+let NetEnrich =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| project NetTime = Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort, RemoteUrl, InitiatingProcessFileName, InitiatingProcessCommandLine;
+
+// ---- Build candidates: join prevalence + creation timing --------------------
+let Candidates =
+DllImageLoads
+| join kind=leftouter (OrgPrevalence) on $left.ImageSHA256 == $right.SHA256
+| join kind=leftouter (DllCreates) on $left.DeviceId == $right.DeviceId and $left.ImageSHA256 == $right.FileSHA256
+| extend Seconds_CreateToLoad =
+    case(
+      isnotempty(FileCreateTime), tolong(datetime_diff('second', ImageLoadTime, FileCreateTime)),
+      long(999999) // unknown create time
+    )
+| extend
+    IsUnsignedOrUntrusted = iif(SignatureStatus !in ("Signed","Valid") or isempty(Signer) or Signer !in~ (TrustedPublishers), 1, 0),
+    IsRare                = iif(coalesce(SeenDeviceCount,0) <= 2, 1, 0),
+    LoaderIsSensitive     = iif(LoaderProc in~ (SensitiveVendors), 1, 0),
+    LoaderKnownGood       = iif(LoaderProc in~ (KnownGoodProcs), 1, 0),
+    FastLoad              = iif(abs(Seconds_CreateToLoad) <= fastLoadSec, 1, 0),
+    DormantShort          = iif(Seconds_CreateToLoad > fastLoadSec and Seconds_CreateToLoad <= dormantShortSec, 1, 0),
+    DormantLong           = iif(Seconds_CreateToLoad > dormantShortSec and Seconds_CreateToLoad <= tolong(dormantLongSec), 1, 0),
+    DormantVeryLong       = iif(Seconds_CreateToLoad > tolong(dormantLongSec) and Seconds_CreateToLoad <= tolong(dormantVeryLongSec), 1, 0);
+
+// ---- Correlate with drivers (±2h), registry (±2h), and network (±2h) -------
+let WithDrivers =
+Candidates
+| join kind=leftouter (SysDrops) on DeviceId
+| where isnull(DriverTime) or (DriverTime between (ImageLoadTime .. ImageLoadTime + 2h));
+
+let WithReg =
+WithDrivers
+| join kind=leftouter (RegPersist) on DeviceId
+| where isnull(RegTime) or (RegTime between (ImageLoadTime .. ImageLoadTime + 2h));
+
+let WithNet =
+WithReg
+| join kind=leftouter (NetEnrich) on DeviceId
+| where isnull(NetTime) or (NetTime between (ImageLoadTime .. ImageLoadTime + 2h));
+
+// ---- Scoring (native only) --------------------------------------------------
+WithNet
+| extend
+    BehaviorScore =
+          (2 * toint(FastLoad))              // quick drop-&-load
+        + (1 * toint(DormantShort))          // delayed load (hours)
+        + (2 * toint(DormantLong))           // delayed (days)
+        + (3 * toint(DormantVeryLong))       // very delayed (weeks)
+        + (2 * toint(IsUnsignedOrUntrusted)) // signature risk
+        + (2 * toint(IsRare))                // rare across org
+        + (1 * toint(LoaderIsSensitive))     // sensitive vendor proc
+        - (1 * toint(LoaderKnownGood)),      // de-weight very common loaders
+    KillChainScore =
+          toint(isnotempty(RegistryKey))     // persistence
+        + toint(isnotempty(SysFile))         // driver activity
+        + toint(isnotempty(RemoteIP) or isnotempty(RemoteUrl)), // network
+    RecencyBonus = iif(ImageLoadTime >= ago(24h), 10, 0),
+    FinalScore = round( (BehaviorScore * 0.6) + (KillChainScore * 0.3) + (RecencyBonus * 0.1), 1)
+| extend
+    Severity = case(
+      FinalScore >= 70, "ALERT",
+      FinalScore >= 40, "HUNT",
+      "LOG"
+    )
+| extend
+    MITRE_Tactics   = "TA0003 Persistence; TA0005 Defense Evasion; TA0011 Command & Control",
+    MITRE_Techniques =
+      strcat_array(
+        pack_array(
+          "T1574.002 DLL Search Order Hijacking",
+          iif(isnotempty(RegistryKey), "T1547.* Registry-based Persistence",""),
+          iif(isnotempty(SysFile), "T1547.006 Kernel/Driver Persistence",""),
+          iif(isnotempty(RemoteIP) or isnotempty(RemoteUrl), "T1071 App-Layer Protocol / T1105 Ingress Tool Transfer","")
+        ), "; "
+      )
+| extend
+    ThreatHunterDirectives = pack_array(
+      strcat("1) Review loader: ", LoaderProc, " (PID ", tostring(LoaderPID), "); signer=", tostring(Signer),
+             "; org-prevalence=", tostring(coalesce(SeenDeviceCount,0))),
+      strcat("2) Timing: create→load=", tostring(Seconds_CreateToLoad), "s (Fast=", tostring(FastLoad),
+             "; DormantLong=", tostring(DormantLong), "; VeryLong=", tostring(DormantVeryLong), ")"),
+      strcat("3) Registry-persist near-time? ", iif(isnotempty(RegistryKey), "YES ("+RegistryKey+")","NO")),
+      strcat("4) Driver dropped near-time? ", iif(isnotempty(SysFile), "YES ("+SysFile+")","NO")),
+      strcat("5) Network seen near-time? ", iif(isnotempty(RemoteIP) or isnotempty(RemoteUrl), "YES ("+coalesce(RemoteUrl, tostring(RemoteIP))+")","NO")),
+      "6) If Severity=ALERT: isolate host, block file, capture memory, collect timeline; open incident.",
+      "7) If Severity=HUNT: pivot by hash/path across estate; check parent/child tree; verify signer & path trust.",
+      "8) If FP: document & allowlist signer/path (with expiry); keep audit trail."
+    )
+| project
+    Severity, FinalScore,
+    ImageLoadTime, DeviceName, LoaderProc, LoaderPID,
+    ImageFileName, ImageSHA256, SignatureStatus, Signer,
+    Seconds_CreateToLoad, FastLoad, DormantShort, DormantLong, DormantVeryLong,
+    SeenDeviceCount,
+    // Driver correlation
+    DriverTime, SysFile, SysFolder, SysSigner, SysInitiator, SysCmd,
+    // Registry correlation
+    RegTime, RegistryKey, RegistryValueName, RegistryValueData,
+    // Minimal network context
+    NetTime, RemoteIP, RemotePort, RemoteUrl,
+    // MITRE + directives
+    MITRE_Tactics, MITRE_Techniques, ThreatHunterDirectives
+| order by Severity desc, FinalScore desc, ImageLoadTime desc
