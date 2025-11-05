@@ -1,0 +1,6 @@
+SigninLogs
+| where TokenIssuerType == "AzureAD"
+| where ResultType == 0  // Success
+| where ClientAppUsed !in ("Browser","Mobile App")
+| summarize count() by UserPrincipalName, IPAddress, AppDisplayName
+| where count_ > 1 and dcount(IPAddress) > 1

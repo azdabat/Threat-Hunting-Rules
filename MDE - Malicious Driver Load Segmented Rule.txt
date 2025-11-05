@@ -1,0 +1,47 @@
+1) Unsigned/invalid-signed or non-Microsoft kernel drivers loaded
+
+DeviceImageLoadEvents
+| where FileName endswith ".sys"
+| where not(FolderPath has @"\Windows\System32\drivers\") or true
+| where SignatureStatus != "Valid" or isempty(Signer) or Signer !contains "Microsoft"
+| project TimeGenerated, DeviceName, FileName, FolderPath, SHA1, Signer, SignatureStatus, InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by TimeGenerated desc
+
+2) Drivers loaded from suspicious (user-writable) paths
+
+DeviceImageLoadEvents
+| where FileName endswith ".sys"
+| where FolderPath has_any (":\\Users\\", ":\\ProgramData\\", ":\\Windows\\Temp\\", ":\\PerfLogs\\", ":\\$Recycle.Bin\\")
+| project TimeGenerated, DeviceName, FileName, FolderPath, SHA1, Signer, SignatureStatus, InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by TimeGenerated desc
+
+3) New service/driver installs (common for malicious driver drops)
+
+Use one of these depending on your data source.
+
+DeviceEvents
+| where ActionType in ("ServiceInstalled","DriverInstallation")
+| project TimeGenerated, DeviceName, AccountName, AdditionalFields, InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by TimeGenerated desc
+
+
+Sentinel (SecurityEvent 7045):
+
+SecurityEvent
+| where EventID == 7045
+| project TimeGenerated, Computer, SubjectUserName, ServiceName, ServiceFileName, ServiceType
+| order by TimeGenerated desc
+
+4) “Drop-then-load” correlation (write to drivers dir → load within 15 min)
+
+let Drops = DeviceFileEvents
+  | where FileName endswith ".sys" and FolderPath has @"\Windows\System32\drivers\"
+  | project DeviceName, SHA1, DropTime=TimeGenerated, DroppedBy=InitiatingProcessFileName, DropCmd=InitiatingProcessCommandLine, FileName, FolderPath;
+DeviceImageLoadEvents
+| where FileName endswith ".sys"
+| project DeviceName, SHA1, LoadTime=TimeGenerated, Loader=InitiatingProcessFileName, LoadCmd=InitiatingProcessCommandLine, FileName
+| join kind=innerunique (Drops) on DeviceName, SHA1
+| where LoadTime between (DropTime .. DropTime + 15m)
+| order by LoadTime desc
+
+Tip: Pair these with the Microsoft Recommended Driver Blocklist (WDAC) and HVCI; alert when any of the above coincides with outbound beaconing from the same host within ±10 min.

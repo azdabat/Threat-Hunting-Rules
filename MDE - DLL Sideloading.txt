@@ -1,0 +1,44 @@
+let lookback = 60m;
+let host = "FIN-LAP-024";
+let suspicious_folders = dynamic(@"['C:\Program Files\', 'C:\Users\Public\', 'C:\Users\%']");
+// Known malicious hashes for immediate correlation (replace with real hashes)
+let malicious_hashes = dynamic(['f1e2d3c4b5a6...']);
+
+// 1) Image loads: unsigned dlls loaded into signed/trusted binaries
+let image_loads = DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where DeviceName =~ host
+| where ImageFileName endswith ".dll"
+| where (Signed == "False" or isnull(Signer) or SignatureStatus == "Unsigned")
+| project Timestamp, DeviceName, ProcessFileName = ProcessName, ImageFileName, ImageHash = ImageHash, Signer, ReportId;
+
+// 2) File creation events in suspicious folders
+let file_creations = DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where DeviceName =~ host
+| where FolderPath startswith_any (suspicious_folders)
+| where FileName endswith ".dll"
+| project FileTimestamp = Timestamp, DeviceName, FileName, FolderPath, FileHash = FileHash, InitiatingProcessFileName, InitiatingProcessCommandLine, ReportId;
+
+// 3) Process events for vendor.exe creating files in temp / program folders
+let process_events = DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where DeviceName =~ host
+| where ProcessFileName has "vendor.exe"
+| project Timestamp, DeviceName, AccountName, ProcessFileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, FileHash, FolderPath, ReportId;
+
+// 4) Network events from the host (HTTP downloads)
+let net_events = DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where DeviceName =~ host
+| where RemoteUrl has_any ("http://", "https://", ".bin", ".exe", ".dll")
+| project Timestamp, DeviceName, RemoteIP, RemoteUrl, InitiatingProcessCommandLine, InitiatingProcessFileName, ReportId;
+
+// Combine: match image loads with file creations via hash, then correlate network
+image_loads
+| join kind=leftouter (file_creations) on $left.ImageHash == $right.FileHash
+| join kind=leftouter (net_events) on $left.DeviceName == $right.DeviceName
+| extend Suspected_Hash = coalesce(ImageHash, FileHash)
+| project Timestamp, DeviceName, ProcessFileName, ImageFileName, Suspected_Hash, FileTimestamp, FolderPath, InitiatingProcessFileName, RemoteIP, RemoteUrl, ReportId
+| where isnotempty(Suspected_Hash) or Suspected_Hash in (malicious_hashes)
+| sort by Timestamp desc

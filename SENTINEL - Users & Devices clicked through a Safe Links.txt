@@ -1,0 +1,49 @@
+// Detect users and devices that clicked through a Safe Links warning page
+UrlClickEvents
+| where TimeGenerated >= ago(7d)
+| where Url has "safelinks.protection.outlook.com"   // Safe Links rewritten URLs
+| where ActionType in ("ClickAllowed", "ClickThrough")  // Clicked through warning
+| extend OriginalUrl = tostring(UrlOriginal)
+| project TimeGenerated, UserPrincipalName, RecipientEmailAddress, OriginalUrl,
+          Url, ActionType, ClickVerdict, NetworkMessageId, DeviceId, IPAddress
+// Join with email context (optional)
+| join kind=leftouter (
+    EmailEvents
+    | project NetworkMessageId, SenderFromAddress, Subject, ThreatTypes
+) on NetworkMessageId
+// Enrich with device and identity context
+| join kind=leftouter (
+    DeviceInfo
+    | summarize arg_max(TimeGenerated, *) by DeviceId
+    | project DeviceId, DeviceName, OnboardingStatus
+) on DeviceId
+| join kind=leftouter (
+    IdentityInfo
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | project AccountUPN, AccountDisplayName, Department
+) on $left.UserPrincipalName == $right.AccountUPN
+// Optional join with sign-ins to correlate login session
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated >= ago(7d)
+    | project UserPrincipalName, IPAddress, AppDisplayName, ClientAppUsed, ConditionalAccessStatus
+) on $left.UserPrincipalName == $right.UserPrincipalName and $left.IPAddress == $right.IPAddress
+// Final projection
+| project
+    Timestamp = TimeGenerated,
+    UserPrincipalName,
+    AccountDisplayName,
+    Department,
+    DeviceName,
+    OnboardingStatus,
+    OriginalUrl,
+    ActionType,
+    ClickVerdict,
+    SenderFromAddress,
+    Subject,
+    ThreatTypes,
+    AppDisplayName,
+    ClientAppUsed,
+    ConditionalAccessStatus,
+    IPAddress
+| order by Timestamp desc

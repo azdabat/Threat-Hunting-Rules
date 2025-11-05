@@ -1,0 +1,189 @@
+// =====================================
+// OAuth App Consent Threat Hunt (SOC)
+// Purpose: Show ALL consent events, flag risky ones,
+// and enrich with token usage, sign-ins, and SP activity.
+// =====================================
+
+let Lookback = 30d;
+
+// --- Known safe apps (first-party Microsoft services).
+// We FLAG (not filter) these, because attackers sometimes abuse first-party IDs.  // 
+let KnownSafeApps = dynamic([
+  "Microsoft Teams","SharePoint Online","Outlook Web App","OneDrive",
+  "Office 365 Portal","Exchange Online","Azure Portal","Microsoft Graph",
+  "Power BI","Intune","Azure AD Connect","Defender for Endpoint",
+  "Defender for Identity","Defender for Office 365","Defender for Cloud",
+  "Planner","Yammer","Forms","Stream","Sway","PowerApps","Power Automate",
+  "Microsoft 365 Admin Center","Microsoft Purview"
+]);
+
+// --- Known safe publishers.
+// These are Microsoft-controlled publishers. Still flag, don't filter.
+let KnownSafePublishers = dynamic([
+  "Microsoft Corporation","Microsoft Azure","Microsoft Online Services",
+  "Office 365 Exchange Online","Windows Azure Active Directory",
+  "Microsoft Purview","Microsoft Teams","SharePoint Online"
+]);
+
+// --- Suspicious UAs that sometimes appear in consent or scripted flows.
+// In practice, most real consent phishing will show browser UAs, but useful context.
+let SuspiciousUserAgents = dynamic([
+  "python","curl","wget","http-client","go-http","okhttp","java","ruby","perl",
+  "postman","insomnia","rest-client","powershell"
+]);
+
+// --- High-risk scopes (exact match).
+let HighRiskExact = dynamic([
+  // Control-plane
+  "Application.ReadWrite.All","AppRoleAssignment.ReadWrite.All","RoleManagement.ReadWrite.Directory",
+  "ServicePrincipal.ReadWrite.All","Directory.ReadWrite.All","Directory.AccessAsUser.All",
+  "Policy.ReadWrite.Authorization","Policy.Read.All","Domain.ReadWrite.All",
+  // Security / Audit
+  "AuditLog.Read.All","Reports.Read.All","SecurityEvents.Read.All",
+  "IdentityRiskEvent.Read.All","IdentityRiskyUser.Read.All",
+  // Exchange / Mail
+  "Mail.Read","Mail.ReadWrite","Mail.Send","MailboxSettings.ReadWrite","EWS.AccessAsUser.All","full_access_as_app",
+  // Files / SharePoint / Teams
+  "Files.ReadWrite.All","Sites.ReadWrite.All","Sites.FullControl.All",
+  "ChannelMessage.Read.All","ChannelMessage.ReadWrite.All","Channel.Read.All","Chat.Read","Chat.ReadWrite",
+  // Calendars / Contacts / Notes / Tasks
+  "Calendars.ReadWrite","Contacts.ReadWrite","Notes.ReadWrite.All","Tasks.ReadWrite",
+  // Devices / Groups / Users
+  "Device.ReadWrite.All","Group.ReadWrite.All","User.ReadWrite.All",
+  // Token persistence
+  "offline_access"
+]);
+
+// --- Regex coverage for *.ReadWrite.All, *.FullControl.All, etc.
+let HighRiskRegex = dynamic([
+  @"^(Application|AppRoleAssignment|ServicePrincipal|RoleManagement|Directory|Domain|Policy)\.(ReadWrite.*|AccessAsUser\.All)$",
+  @"^(AuditLog|Reports|Security|IdentityRisk(Event|yUser)|Threat|InformationProtectionPolicy)\.(Read.*|ReadWrite.*)$",
+  @"^(Mail|MailboxSettings)\.(Read.*|ReadWrite.*|Send)$",
+  @"^(Files|Sites)\.(Read.*|ReadWrite.*|FullControl\.All)$",
+  @"^(Group|User|Device)\.(ReadWrite.*)$",
+  @"^(Channel(Message)?|Chat)\.(Read.*|ReadWrite.*)$",
+  @".*\.FullControl\.All$",
+  @".*\.ReadWrite\.All$"
+]);
+
+// ========================================================
+// Step 1: Gather consent events (AuditLogs).
+// These show when a user/admin granted permissions to an app.
+// ========================================================
+let Consents = AuditLogs
+| where TimeGenerated >= ago(Lookback)
+| where OperationName in (
+    "Consent to application",
+    "Add delegated permission grant",
+    "Add app role assignment grant to service principal",
+    "Add service principal credentials"
+  )
+| where Result =~ "success"
+| extend Target = iff(array_length(TargetResources) > 0, TargetResources[0], dynamic(null))
+| extend AppId          = tostring(Target.id),
+         AppDisplayName = tostring(Target.displayName),
+         ModifiedProps  = tostring(Target.modifiedProperties),
+         InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
+         IPAddress      = tostring(InitiatedBy.user.ipAddress),
+         UserAgent      = tostring(InitiatedBy.user.userAgent)
+| extend Props = parse_json(ModifiedProps)
+| mv-expand P = Props
+| extend PropName = tostring(P.displayName), PropValue = tostring(P.newValue)
+| summarize
+    IsAppOnlyRaw       = any(iff(PropName == "ConsentContext.IsAppOnly", PropValue, "")),
+    OnBehalfOfAllRaw   = any(iff(PropName == "ConsentContext.OnBehalfOfAll", PropValue, "")),
+    PublisherNameRaw   = any(iff(PropName == "ConsentContext.PublisherName", PropValue, "")),
+    ResourceNameRaw    = any(iff(PropName == "ConsentContext.ResourceDisplayName", PropValue, "")),
+    DelegatedRaw       = any(iff(PropName == "Scope", PropValue, "")),
+    AppRolesRaw        = any(iff(PropName == "AppRoles", PropValue, "")),
+    CreatedTime        = min(TimeGenerated),
+    Initiator          = any(InitiatorUPN),
+    IPAddress          = any(IPAddress),
+    UserAgent          = any(UserAgent)
+  by AppId, AppDisplayName
+| extend IsAppOnly   = tobool(coalesce(parse_json(IsAppOnlyRaw), false)),
+         OnBehalfAll = tobool(coalesce(parse_json(OnBehalfOfAllRaw), false)),
+         PublisherName = trim(@"""", tostring(PublisherNameRaw)),
+         ResourceName  = trim(@"""", tostring(ResourceNameRaw))
+| extend DelegatedList = split(replace_string(tostring(DelegatedRaw), "\"",""), " ")
+| extend AppRolesJson  = parse_json(AppRolesRaw)
+| mv-expand RoleElt = iif(isnull(AppRolesJson) or array_length(AppRolesJson)==0, dynamic(null), AppRolesJson) to typeof(string)
+| extend AppRole = trim(" ", trim("\"", tostring(RoleElt)))
+| extend AllPerms = array_concat(DelegatedList, pack_array(AppRole))
+| mv-expand Permission in AllPerms
+| extend Permission = trim(" ", trim("\"", tostring(Permission)))
+| where isnotempty(Permission)
+| extend IsHighExact = iif(Permission in (HighRiskExact), 1, 0)
+| extend IsHighRegex = iif(array_length(array_filter(HighRiskRegex, (re:string) { Permission matches regex re })) > 0, 1, 0)
+| extend IsHighRiskPermission = iif(IsHighExact==1 or IsHighRegex==1 or tolower(Permission) == "offline_access", 1, 0)
+| summarize
+    HighRiskPermissionCount = sum(IsHighRiskPermission),
+    HighRiskPerms = make_set_if(Permission, IsHighRiskPermission==1, 200),
+    Permissions   = make_set(Permission, 1000),
+    IsAppOnly     = any(IsAppOnly),
+    OnBehalfAll   = any(OnBehalfAll),
+    PublisherName = any(PublisherName),
+    ResourceName  = any(ResourceName),
+    CreatedTime   = any(CreatedTime),
+    Initiator     = any(Initiator),
+    IPAddress     = any(IPAddress),
+    UserAgent     = any(UserAgent)
+  by AppId, AppDisplayName
+| extend IsKnownSafeApp = iif(AppDisplayName in~ (KnownSafeApps), "Yes", "No"),
+         IsKnownSafePub = iif(PublisherName in~ (KnownSafePublishers), "Yes", "No"),
+         SuspiciousUA   = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), "Yes", "No")
+| extend ConsentType = iif(OnBehalfAll, "Admin (tenant-wide)", "User"),
+         GrantType   = iif(IsAppOnly,   "Application (client credentials)", "Delegated (user)")
+| project AppId, AppDisplayName, CreatedTime, Initiator, IPAddress, UserAgent,
+          ConsentType, GrantType, PublisherName, ResourceName,
+          HighRiskPermissionCount, HighRiskPerms, Permissions,
+          IsKnownSafeApp, IsKnownSafePub, SuspiciousUA;
+
+// ========================================================
+// Step 2: Enrich with Token Issuance (usage after consent).
+// Shows whether this app has minted tokens post-consent.
+// ========================================================
+let TokenUsage = TokenIssuanceLogs
+| where TimeGenerated >= ago(60m)
+| project AppId=tostring(AppId), TokenIssuedAt=TimeGenerated,
+          GrantType=tostring(GrantType), Account=tostring(UserPrincipalName),
+          TokenIPAddress=IPAddress
+| summarize FirstToken=min(TokenIssuedAt), LastToken=max(TokenIssuedAt), TokenUseCount=count() by AppId, Account;
+
+// ========================================================
+// Step 3: Enrich with Interactive sign-ins (SigninLogs).
+// Focus on Microsoft Graph resource to see scripted usage.
+// ========================================================
+let GraphSignins = SigninLogs
+| where TimeGenerated >= ago(Lookback)
+| where ResourceServicePrincipalId == "00000003-0000-0000-c000-000000000000"
+| project AppId=tostring(AppId), GraphSigninAt=TimeGenerated,
+          UA=tostring(UserAgent), SigninIP=IPAddress, Account=tostring(UserPrincipalName)
+| summarize FirstGraph=min(GraphSigninAt), LastGraph=max(GraphSigninAt), GraphSignins=count() by AppId, Account;
+
+// ========================================================
+// Step 4: Enrich with Service Principal sign-ins (daemon apps).
+// These are app-only (no user) tokens calling Graph/ARM.
+// ========================================================
+let SPActivity = ServicePrincipalSignInLogs
+| where TimeGenerated >= ago(Lookback)
+| project AppId=tostring(AppId), SPName=tostring(ServicePrincipalName),
+          SPIP=IPAddress, SPTime=TimeGenerated
+| summarize FirstSP=min(SPTime), LastSP=max(SPTime), SPCalls=count(), SampleIPs=make_set(SPIP,3) by AppId, SPName;
+
+// ========================================================
+// Step 5: Combine everything.
+// ========================================================
+Consents
+| join kind=leftouter TokenUsage on AppId
+| join kind=leftouter GraphSignins on AppId
+| join kind=leftouter SPActivity on AppId
+| project AppId, AppDisplayName, CreatedTime, ConsentType, GrantType,
+          Initiator, IPAddress, UserAgent,
+          PublisherName, ResourceName, 
+          HighRiskPermissionCount, HighRiskPerms, Permissions,
+          IsKnownSafeApp, IsKnownSafePub, SuspiciousUA,
+          FirstToken, LastToken, TokenUseCount,
+          FirstGraph, LastGraph, GraphSignins,
+          FirstSP, LastSP, SPCalls, SampleIPs
+| order by CreatedTime desc
