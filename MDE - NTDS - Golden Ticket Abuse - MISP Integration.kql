@@ -70,7 +70,7 @@ let MISPIndicators = ThreatIntelligenceIndicator
 
 
 // ----------------------------
-// 1️⃣ Suspicious NTDS-related processes - MISP Integration
+// 1️ Suspicious NTDS-related processes - MISP Integration
 // ----------------------------
 let SuspiciousProcesses = DeviceProcessEvents
 | where Timestamp >= ago(lookback)
@@ -91,7 +91,7 @@ let SuspiciousProcessesEnriched = SuspiciousProcesses
 | extend TotalScore = Score + coalesce(TI_Score,0);
 
 // ----------------------------
-// 2️⃣ Suspicious NTDS file access / copies
+// 2️ Suspicious NTDS file access / copies
 // ----------------------------
 let SuspiciousFiles = DeviceFileEvents
 | where Timestamp >= ago(lookback)
@@ -109,8 +109,8 @@ let SuspiciousFilesEnriched = SuspiciousFiles
 | extend TotalScore = Score + coalesce(TI_Score,0);
 
 // ----------------------------
-// 3️⃣ Suspicious network exfil events
-// ----------------------------
+// 3️ Suspicious network exfil events
+// ---------------------------
 let SuspiciousNetwork = DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
 | where InitiatingProcessCommandLine has_any ("Invoke-NinjaCopy","secretsdump.py","secret_dump","A c i ntds","Invoke-Mimikatz")
@@ -127,7 +127,7 @@ let SuspiciousNetworkEnriched = SuspiciousNetwork
 | extend TotalScore = Score + coalesce(TI_Score,0);
 
 // ----------------------------
-// 4️⃣ Correlation: Boost network score if following suspicious process/file
+// 4️ Correlation: Boost network score if following suspicious process/file
 // ----------------------------
 let CorrelatedNetwork = SuspiciousNetworkEnriched
 | join kind=inner (
@@ -138,13 +138,13 @@ let CorrelatedNetwork = SuspiciousNetworkEnriched
 | extend TotalScore = TotalScore + 20  // boost correlated events
 
 // ----------------------------
-// 5️⃣ Combine all indicators
+// 5️ Combine all indicators
 // ----------------------------
 let AllIndicators = union(SuspiciousProcessesEnriched, SuspiciousFilesEnriched, CorrelatedNetwork)
 | extend Time = Timestamp;
 
 // ----------------------------
-// 6️⃣ Summarize by Device + File/Process
+// 6️ Summarize by Device + File/Process
 // ----------------------------
 AllIndicators
 | summarize TotalScore = sum(TotalScore),
@@ -154,5 +154,6 @@ AllIndicators
             Samples = make_list(pack_all())
             by DeviceName, FileName, InitiatingProcessFileName
 | where TotalSco
+
 
 
