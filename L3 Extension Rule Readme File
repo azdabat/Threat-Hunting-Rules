@@ -1,4 +1,4 @@
-# 🧩 Malicious Browser Extension Threat Detection
+# Malicious Browser Extension Threat Detection
 
 **Author**: Ala Dabat  
 **Platform**: Microsoft Defender for Endpoint (MDE) + Microsoft Sentinel  
@@ -11,7 +11,7 @@
 
 ---
 
-## 🎯 Objective
+##Objective
 
 Detect installation of **malicious or vulnerable browser extensions** (.crx or unpacked folders), whether:
 
@@ -21,7 +21,7 @@ Detect installation of **malicious or vulnerable browser extensions** (.crx or u
 
 ---
 
-## 🔍 Detection Logic (L3 Threat Hunt)
+## Detection Logic (L3 Threat Hunt)
 
 This detection is built for **advanced threat hunting**:
 
@@ -36,7 +36,7 @@ This detection is built for **advanced threat hunting**:
 
 ---
 
-## 🧠 Scoring Breakdown
+##  Scoring Breakdown
 
 | Signal                          | Weight | Why it Matters |
 |---------------------------------|--------|----------------|
@@ -50,7 +50,7 @@ This detection is built for **advanced threat hunting**:
 
 ---
 
-## 🧪 IOC-Only Variant (Simplified)
+##  IOC-Only Variant (Simplified)
 
 ```kql
 let MaliciousExtensions = externaldata (
