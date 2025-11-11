@@ -1,0 +1,71 @@
+# 🧩 Malicious Browser Extension Threat Detection
+
+**Author**: Ala Dabat  
+**Platform**: Microsoft Defender for Endpoint (MDE) + Microsoft Sentinel  
+**Feed Source**: [mthcht/awesome-lists - Browser Extensions](https://github.com/mthcht/awesome-lists)  
+**MITRE ATT&CK**:  
+- T1176 – Browser Extensions  
+- T1204.002 – User Execution: Malicious File  
+- T1059 – Command and Scripting Interpreter  
+- T1036 – Masquerading  
+
+---
+
+## 🎯 Objective
+
+Detect installation of **malicious or vulnerable browser extensions** (.crx or unpacked folders), whether:
+
+- Directly matched against a known bad feed  
+- Behaviorally suspicious (e.g., rare, network-active, loaded by LOLBin)  
+- Installed via non-standard paths (e.g., custom loaders or remote scripts)
+
+---
+
+## 🔍 Detection Logic (L3 Threat Hunt)
+
+This detection is built for **advanced threat hunting**:
+
+1. **Monitors `.crx` files or folder-based extension drops**
+2. **Correlates with a known threat feed**
+3. **Enriches with**:
+   - Process creation (`DeviceProcessEvents`)
+   - Network activity (`DeviceNetworkEvents`)
+   - Organization-wide rarity (`DeviceCount`)
+4. **Applies a weighted scoring model** for high-confidence triage
+5. **MITRE tags & hunter notes** included inline
+
+---
+
+## 🧠 Scoring Breakdown
+
+| Signal                          | Weight | Why it Matters |
+|---------------------------------|--------|----------------|
+| Matched in malicious feed       | +3     | Confirmed IOC |
+| Loaded by browser process       | +1     | Indicates real use |
+| Suspicious PowerShell/JS in cmd | +1     | Eval, fetch, etc. |
+| Network activity post-install   | +1     | C2 or beaconing |
+| Rare in organization            | +1     | Unusual/targeted |
+
+> Default `Score >= 3` for hunts, `Score >= 4` for alerting
+
+---
+
+## 🧪 IOC-Only Variant (Simplified)
+
+```kql
+let MaliciousExtensions = externaldata (
+    browser_extension: string, browser_extension_id: string, metadata_category: string, 
+    metadata_type: string, metadata_link: string, metadata_comment: string
+)
+["https://raw.githubusercontent.com/mthcht/awesome-lists/refs/heads/main/Lists/Browser%20Extensions/browser_extensions_list.csv"]
+with (format="csv", ignoreFirstRecord=true)
+| extend NormalizedExtensionID = trim(" ", tolower(browser_extension_id))
+| where isnotempty(NormalizedExtensionID) and metadata_type == "malicious";
+
+DeviceFileEvents
+| where ActionType == "FileCreated" and FileName endswith ".crx"
+| extend NormalizedExtractedID = trim(" ", tolower(extract(@"([a-zA-Z0-9]{32})", 1, FileName)))
+| where isnotempty(NormalizedExtractedID)
+| join kind=inner MaliciousExtensions on $left.NormalizedExtractedID == $right.NormalizedExtensionID
+| project Timestamp, DeviceName, FileName, FolderPath, InitiatingProcessCommandLine, SHA256,
+          browser_extension, metadata_type, metadata_link
