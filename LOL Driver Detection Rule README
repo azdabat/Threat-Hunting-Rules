@@ -1,4 +1,4 @@
-# 🧩 Advanced Malicious & Vulnerable Driver Detection (LOLDrivers & BYOVD)
+# Advanced Malicious & Vulnerable Driver Detection (LOLDrivers & BYOVD)
 
 **Author**: Ala Dabat  
 **Platform**: Microsoft Defender for Endpoint (MDE) / Microsoft Sentinel  
@@ -12,7 +12,7 @@
 
 ---
 
-## 🎯 Objective
+## Objective
 
 Detect malicious or vulnerable kernel‑mode drivers being **loaded or staged on endpoints**, including:
 - BYOVD (Bring‑Your‑Own‑Vulnerable‑Driver) techniques  
@@ -24,19 +24,19 @@ This rule is designed for **SOC‑level threat hunting and detection engineering
 
 ---
 
-## 🧠 Context
+##  Context
 
 Attackers increasingly deploy **legitimate but exploitable drivers** to disable EDRs, patch the kernel, or gain SYSTEM‑level access.  
 The rule correlates **driver load events**, **file creation timestamps**, and **external threat feeds** (e.g. MISP) to identify:
 
-- ⚡ Immediate driver loads after drop (<5 minutes) — signs of active exploitation  
-- 🕒 Dormant drivers loaded after >7 days — stealth implants or delayed activation  
-- 🧾 Unsigned or anomalous signatures  
-- 📂 Suspicious load locations (`C:\Users\Public\`, `\AppData\`, etc.)
+- Immediate driver loads after drop (<5 minutes) — signs of active exploitation  
+-  Dormant drivers loaded after >7 days — stealth implants or delayed activation  
+-  Unsigned or anomalous signatures  
+- Suspicious load locations (`C:\Users\Public\`, `\AppData\`, etc.)
 
 ---
 
-## 🧩 Detection Logic Overview
+## Detection Logic Overview
 
 1. **File Creation Correlation**  
    - Monitors `.sys` driver files created/moved in non‑system directories.  
@@ -59,7 +59,7 @@ The rule correlates **driver load events**, **file creation timestamps**, and **
 
 ---
 
-## ⚙️ Scoring & Heuristic Breakdown
+##  Scoring & Heuristic Breakdown
 
 | Heuristic | Condition | Typical Indicator | Weight |
 |------------|------------|------------------|--------|
@@ -72,7 +72,7 @@ The rule correlates **driver load events**, **file creation timestamps**, and **
 
 ---
 
-## 🧾 Example Outputs (Simulated)
+##  Example Outputs (Simulated)
 
 | FileName | Category | PathSuspicious | Delay | Signature | HitClass |
 |-----------|-----------|----------------|--------|------------|-----------|
@@ -88,7 +88,7 @@ Each result includes a pre‑built VirusTotal link and analyst directives such a
 
 ---
 
-## 🧰 Data Sources
+##  Data Sources
 
 | Table | Description |
 |--------|-------------|
@@ -98,7 +98,7 @@ Each result includes a pre‑built VirusTotal link and analyst directives such a
 
 ---
 
-## 🔐 MITRE Alignment
+##  MITRE Alignment
 
 | Tactic | Technique | Description |
 |--------|------------|-------------|
@@ -121,7 +121,7 @@ Each result includes a pre‑built VirusTotal link and analyst directives such a
 
 ---
 
-## 🧠 Operational Notes
+##  Operational Notes
 
 - `externaldata()` works best in **Sentinel**; replace with a **Watchlist** for production.  
 - The rule **correlates delayed activation**, catching stealth BYOVD implants missed by IOC-only detection.  
