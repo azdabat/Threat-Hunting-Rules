@@ -1,13 +1,12 @@
 // =====================================
-// OAuth App Consent Threat Hunt (SOC)
-// Purpose: Show ALL consent events, flag risky ones,
-// and enrich with token usage, sign-ins, and SP activity.
+// OAuth Consent Abuse Detection Rule (Production Ready)
+// Author: Ala Dabat | Version: 2025-11 | Platform: Microsoft Sentinel
+// Purpose: Identify suspicious or high-risk OAuth consent activity in Entra ID
+// MITRE: TA0001 (Initial Access), TA0003 (Persistence) | T1550.001 (OAuth Token Abuse)
 // =====================================
 
 let Lookback = 30d;
 
-// --- Known safe apps (first-party Microsoft services).
-// We FLAG (not filter) these, because attackers sometimes abuse first-party IDs.  // 
 let KnownSafeApps = dynamic([
   "Microsoft Teams","SharePoint Online","Outlook Web App","OneDrive",
   "Office 365 Portal","Exchange Online","Azure Portal","Microsoft Graph",
@@ -17,44 +16,31 @@ let KnownSafeApps = dynamic([
   "Microsoft 365 Admin Center","Microsoft Purview"
 ]);
 
-// --- Known safe publishers.
-// These are Microsoft-controlled publishers. Still flag, don't filter.
 let KnownSafePublishers = dynamic([
   "Microsoft Corporation","Microsoft Azure","Microsoft Online Services",
   "Office 365 Exchange Online","Windows Azure Active Directory",
   "Microsoft Purview","Microsoft Teams","SharePoint Online"
 ]);
 
-// --- Suspicious UAs that sometimes appear in consent or scripted flows.
-// In practice, most real consent phishing will show browser UAs, but useful context.
 let SuspiciousUserAgents = dynamic([
   "python","curl","wget","http-client","go-http","okhttp","java","ruby","perl",
   "postman","insomnia","rest-client","powershell"
 ]);
 
-// --- High-risk scopes (exact match).
 let HighRiskExact = dynamic([
-  // Control-plane
   "Application.ReadWrite.All","AppRoleAssignment.ReadWrite.All","RoleManagement.ReadWrite.Directory",
   "ServicePrincipal.ReadWrite.All","Directory.ReadWrite.All","Directory.AccessAsUser.All",
   "Policy.ReadWrite.Authorization","Policy.Read.All","Domain.ReadWrite.All",
-  // Security / Audit
   "AuditLog.Read.All","Reports.Read.All","SecurityEvents.Read.All",
   "IdentityRiskEvent.Read.All","IdentityRiskyUser.Read.All",
-  // Exchange / Mail
   "Mail.Read","Mail.ReadWrite","Mail.Send","MailboxSettings.ReadWrite","EWS.AccessAsUser.All","full_access_as_app",
-  // Files / SharePoint / Teams
   "Files.ReadWrite.All","Sites.ReadWrite.All","Sites.FullControl.All",
   "ChannelMessage.Read.All","ChannelMessage.ReadWrite.All","Channel.Read.All","Chat.Read","Chat.ReadWrite",
-  // Calendars / Contacts / Notes / Tasks
   "Calendars.ReadWrite","Contacts.ReadWrite","Notes.ReadWrite.All","Tasks.ReadWrite",
-  // Devices / Groups / Users
   "Device.ReadWrite.All","Group.ReadWrite.All","User.ReadWrite.All",
-  // Token persistence
   "offline_access"
 ]);
 
-// --- Regex coverage for *.ReadWrite.All, *.FullControl.All, etc.
 let HighRiskRegex = dynamic([
   @"^(Application|AppRoleAssignment|ServicePrincipal|RoleManagement|Directory|Domain|Policy)\.(ReadWrite.*|AccessAsUser\.All)$",
   @"^(AuditLog|Reports|Security|IdentityRisk(Event|yUser)|Threat|InformationProtectionPolicy)\.(Read.*|ReadWrite.*)$",
@@ -66,10 +52,6 @@ let HighRiskRegex = dynamic([
   @".*\.ReadWrite\.All$"
 ]);
 
-// ========================================================
-// Step 1: Gather consent events (AuditLogs).
-// These show when a user/admin granted permissions to an app.
-// ========================================================
 let Consents = AuditLogs
 | where TimeGenerated >= ago(Lookback)
 | where OperationName in (
@@ -131,18 +113,10 @@ let Consents = AuditLogs
   by AppId, AppDisplayName
 | extend IsKnownSafeApp = iif(AppDisplayName in~ (KnownSafeApps), "Yes", "No"),
          IsKnownSafePub = iif(PublisherName in~ (KnownSafePublishers), "Yes", "No"),
-         SuspiciousUA   = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), "Yes", "No")
-| extend ConsentType = iif(OnBehalfAll, "Admin (tenant-wide)", "User"),
-         GrantType   = iif(IsAppOnly,   "Application (client credentials)", "Delegated (user)")
-| project AppId, AppDisplayName, CreatedTime, Initiator, IPAddress, UserAgent,
-          ConsentType, GrantType, PublisherName, ResourceName,
-          HighRiskPermissionCount, HighRiskPerms, Permissions,
-          IsKnownSafeApp, IsKnownSafePub, SuspiciousUA;
+         SuspiciousUA   = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), "Yes", "No"),
+         ConsentType = iif(OnBehalfAll, "Admin (tenant-wide)", "User"),
+         GrantType   = iif(IsAppOnly,   "Application (client credentials)", "Delegated (user)");
 
-// ========================================================
-// Step 2: Enrich with Token Issuance (usage after consent).
-// Shows whether this app has minted tokens post-consent.
-// ========================================================
 let TokenUsage = TokenIssuanceLogs
 | where TimeGenerated >= ago(60m)
 | project AppId=tostring(AppId), TokenIssuedAt=TimeGenerated,
@@ -150,10 +124,6 @@ let TokenUsage = TokenIssuanceLogs
           TokenIPAddress=IPAddress
 | summarize FirstToken=min(TokenIssuedAt), LastToken=max(TokenIssuedAt), TokenUseCount=count() by AppId, Account;
 
-// ========================================================
-// Step 3: Enrich with Interactive sign-ins (SigninLogs).
-// Focus on Microsoft Graph resource to see scripted usage.
-// ========================================================
 let GraphSignins = SigninLogs
 | where TimeGenerated >= ago(Lookback)
 | where ResourceServicePrincipalId == "00000003-0000-0000-c000-000000000000"
@@ -161,29 +131,40 @@ let GraphSignins = SigninLogs
           UA=tostring(UserAgent), SigninIP=IPAddress, Account=tostring(UserPrincipalName)
 | summarize FirstGraph=min(GraphSigninAt), LastGraph=max(GraphSigninAt), GraphSignins=count() by AppId, Account;
 
-// ========================================================
-// Step 4: Enrich with Service Principal sign-ins (daemon apps).
-// These are app-only (no user) tokens calling Graph/ARM.
-// ========================================================
 let SPActivity = ServicePrincipalSignInLogs
 | where TimeGenerated >= ago(Lookback)
 | project AppId=tostring(AppId), SPName=tostring(ServicePrincipalName),
           SPIP=IPAddress, SPTime=TimeGenerated
 | summarize FirstSP=min(SPTime), LastSP=max(SPTime), SPCalls=count(), SampleIPs=make_set(SPIP,3) by AppId, SPName;
 
-// ========================================================
-// Step 5: Combine everything.
-// ========================================================
 Consents
 | join kind=leftouter TokenUsage on AppId
 | join kind=leftouter GraphSignins on AppId
 | join kind=leftouter SPActivity on AppId
+| extend RiskScore = 
+    1 * HighRiskPermissionCount
+    + 2 * iif(ConsentType == "Admin (tenant-wide)", 1, 0)
+    + 2 * iif(GrantType == "Application (client credentials)", 1, 0)
+    + 1 * iif(SuspiciousUA == "Yes", 1, 0)
+    + 1 * iif(IsKnownSafeApp == "No", 1, 0)
+    + 1 * iif(IsKnownSafePub == "No", 1, 0)
+    + 2 * iif(TokenUseCount > 0 or SPCalls > 0, 1, 0)
+| extend HuntingDirectives = strcat(
+    "App '", AppDisplayName, "' granted ", tostring(HighRiskPermissionCount), " high-risk permissions. ",
+    "ConsentType=", ConsentType, " | GrantType=", GrantType, ". ",
+    "Initiated by ", Initiator, " from ", IPAddress, ". ",
+    "TokenUse=", tostring(TokenUseCount), " | SPCalls=", tostring(SPCalls), ". ",
+    "KnownSafeApp=", IsKnownSafeApp, " | SuspiciousUA=", SuspiciousUA, ". ",
+    "Verify AppID ", AppId, " and pivot on permissions, user, and IP." 
+)
+| extend MITRE_Tactic = "TA0001: Initial Access; TA0003: Persistence",
+         MITRE_Technique = "T1550.001: OAuth Token Abuse"
 | project AppId, AppDisplayName, CreatedTime, ConsentType, GrantType,
-          Initiator, IPAddress, UserAgent,
-          PublisherName, ResourceName, 
+          Initiator, IPAddress, UserAgent, PublisherName, ResourceName,
           HighRiskPermissionCount, HighRiskPerms, Permissions,
           IsKnownSafeApp, IsKnownSafePub, SuspiciousUA,
           FirstToken, LastToken, TokenUseCount,
           FirstGraph, LastGraph, GraphSignins,
-          FirstSP, LastSP, SPCalls, SampleIPs
-| order by CreatedTime desc
+          FirstSP, LastSP, SPCalls, SampleIPs,
+          RiskScore, HuntingDirectives, MITRE_Tactic, MITRE_Technique
+| order by RiskScore desc, CreatedTime desc
