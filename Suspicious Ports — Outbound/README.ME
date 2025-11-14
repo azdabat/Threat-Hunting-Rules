@@ -1,96 +1,213 @@
-Suspicious Port Threat Hunt
-High-Fidelity Detection With External CSV Intel + Full Process Attribution
+# 📘 Suspicious Port Threat Hunting Rule  
+### High-Fidelity Network Port Detection Using External Intelligence + Full Process Attribution  
+**Author:** Ala Dabat  
+**Updated:** 2025-11-14  
 
-Author: Ala Dabat
+---
 
-🧠 Overview
+## 🚀 Purpose
 
-This detection identifies any outbound or inbound connection using ports flagged as suspicious in a trusted open-source CSV feed.
-Unlike basic port-matching rules, this version includes real executable attribution, command line, parent process, signer, hash, MITRE mapping, and analyst hunting directives.
+This rule identifies network connections using **suspicious or malicious ports** sourced from an external intelligence CSV feed, and correlates them with **real process telemetry**, including:
 
-The rule is designed for:
+- Executable name  
+- Command-line  
+- SHA256  
+- Parent process  
+- Signer  
+- User context  
+- MITRE ATT&CK mapping  
+- Risk scoring  
+- Analyst hunting directives  
 
-Supply chain compromise detection
+Designed for **SOC L2.5–L3**, **Threat Hunters**, and **CTI analysts**.
 
-C2 beacons over non-standard ports
+---
 
-Malware using obscure ports
+## 🧠 Detection Summary
 
-Proxy / tunneling / SOCKS abuse
+### ✔ What This Rule Detects
+- Suspicious outbound ports flagged by open-source TI  
+- Malware beaconing over rare or disguised ports  
+- Unsigned / malicious binaries making outbound connections  
+- Supply-chain malware C2 behaviour (3CX, SolarWinds, F5)  
+- Encrypted proxy tunnels (SOCKS, OpenVPN)  
+- LOLBins establishing network sessions  
+- Multi-stage loaders communicating through uncommon ports  
 
-Unknown services listening on unusual ports
+### ❌ What This Rule Does *NOT* Detect
 
-Zero-day or AI-generated implants using rare ports
+| Not Detected | Reason |
+|--------------|--------|
+| Malware with no network activity | No connections = no trigger |
+| C2 over ports 80/443 | Requires behavioural rules |
+| QUIC-based C2 | Encrypted UDP hides ports |
+| DNS-over-HTTPS C2 | Hidden behind HTTPS |
+| Port knocking | Needs sequential logic |
+| Localhost C2 | Intentionally excluded |
 
-⭐ What This Rule Detects
-Category	Detected?	Description
-Suspicious outbound ports	🟩 Yes	Matches against CSV intel feed
-Malware using uncommon ports	🟩 Yes	C2, encrypted channels, tunneling
-Unsigned processes using flagged ports	🟩 Yes	Parent/child inspection enabled
-Abnormal command-line behaviour	🟩 Yes	Powershell, mshta, curl, rundll32
-Supply-chain malware C2	🟩 Yes	3CX / F5 style C2 over rare ports
-Multi-stage implants	🟩 Yes	Hash/signature extraction included
-❌ What This Rule Does NOT Detect (By Design)
-Missed Category	Reason
-Local-only malware without network traffic	No port usage to match
-Reverse shells on common ports (80/443)	Requires behavioural heuristics
-QUIC-specific C2	Encrypted UDP may hide port semantics
-Port-knocking sequences	Requires stateful long-window correlation
-Localhost/loopback C2	Explicitly filtered to reduce noise
-DNS-over-HTTPS C2	Not identified as port misuse
+---
 
-If you want, I can generate a paired DoH / QUIC high-fidelity rule.
+## 📡 Data Sources
 
-🔗 Data Sources Used
+| Table | Purpose |
+|-------|---------|
+| **DeviceNetworkEvents** | Outbound network connections |
+| **DeviceProcessEvents** | Enriched process telemetry |
+| **External CSV Feed** | Suspicious ports & metadata |
 
+CSV feed:  
+`https://github.com/mthcht/awesome-lists/blob/main/Lists/suspicious_ports_list.csv`
+
+---
+
+## 🧩 MITRE ATT&CK Mapping
+
+| Tactic | Technique | Description |
+|--------|-----------|-------------|
+| **TA0011** | **T1071** | Application Layer C2 |
+| | **T1090** | Proxy/Tunneling |
+| | **T1573** | Encrypted channel |
+
+---
+
+## 🕵️‍♂️ Analyst Hunting Directives
+
+1. Identify the executable creating the suspicious connection.  
+2. Investigate parent process (LOLBins often spawn C2).  
+3. Inspect command-line arguments for downloads or encoded payloads.  
+4. Review SHA256 and signer reputation.  
+5. Check frequency of connections → beaconing patterns.  
+6. Perform VirusTotal lookup on destination IP.  
+7. Check user session ownership.  
+8. If malicious → isolate host and collect memory.
+
+---
+
+# 🔥 Final Detection Rule
+
+```kql
+// Suspicious Port Threat Hunt — Full Process Attribution
+// Author: Ala Dabat
+
+// ---- Load external CSV of suspicious ports ----
+let SuspiciousPortsData =
+    externaldata(
+        dest_port:int,
+        metadata_comment:string,
+        metadata_confidence:string,
+        metadata_detection_type:string,
+        metadata_link:string,
+        metadata_reference:string
+    )
+    ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
+    with (format="csv", ignoreFirstRecord=true)
+    | where metadata_confidence != "low";
+
+let SuspiciousPortList = toscalar(SuspiciousPortsData | summarize make_set(dest_port));
+
+let PortDetails = SuspiciousPortsData
+| project dest_port, metadata_comment, metadata_confidence;
+
+// ---- Main Hunt ----
 DeviceNetworkEvents
+| where RemotePort in (SuspiciousPortList)
+| where not(RemoteIP startswith "10." or RemoteIP startswith "192.168." or RemoteIP startswith "172.")
+| join kind=inner PortDetails on $left.RemotePort == $right.dest_port
 
-DeviceProcessEvents (via join)
+// ---- Extract process context ----
+| extend 
+    Proc = InitiatingProcessFileName,
+    ProcCL = InitiatingProcessCommandLine,
+    ProcSHA256 = InitiatingProcessSHA256,
+    ProcSigner = InitiatingProcessSigner,
+    ProcPath = InitiatingProcessFolderPath,
+    ParentProc = InitiatingProcessParentFileName,
+    User = InitiatingProcessAccountName
 
-External CSV containing suspicious port intel
+// ---- Summarise for triage ----
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    Count = count(),
+    SampleProcess = arg_max(Timestamp, Proc),
+    SampleCommand = arg_max(Timestamp, ProcCL),
+    SampleHash = arg_max(Timestamp, ProcSHA256),
+    SampleSigner = arg_max(Timestamp, ProcSigner),
+    SampleParent = arg_max(Timestamp, ParentProc),
+    Users = make_set(User,10)
+  by DeviceName, RemoteIP, RemotePort, metadata_comment, metadata_confidence
 
-🧩 MITRE ATT&CK Coverage
-Tactic	Technique	Description
-TA0011 – Command & Control	T1071	Application layer protocol abuse
-	T1090	Proxy / tunneling activity
-	T1573	Encrypted channel C2
-🧭 Hunter Directives (SOC Analyst Workflow)
+// ---- Risk Classification ----
+| extend RiskLevel = case(
+    metadata_confidence == "high", "CRITICAL",
+    metadata_confidence == "medium", "HIGH",
+    "MEDIUM"
+),
+MITRE_Tactics = "TA0011 Command and Control",
+MITRE_Techniques = case(
+    RemotePort == 1080, "T1090 Proxy",
+    RemotePort == 1194, "T1573 Encrypted Channel",
+    "T1071 Application Layer Protocol"
+),
+VT_Link = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
 
-Verify legitimacy of the process using this port.
+// ---- Hunter Directives ----
+| extend HuntingDirectives = pack_array(
+    strcat("1) Investigate executable: ", SampleProcess),
+    strcat("2) Parent process: ", SampleParent),
+    strcat("3) Command line: ", SampleCommand),
+    strcat("4) SHA256: ", SampleHash, " | Signer: ", SampleSigner),
+    strcat("5) Review ", tostring(Count), " connections to ", RemoteIP),
+    strcat("6) Port Reason: ", metadata_comment),
+    strcat("7) VirusTotal: ", VT_Link),
+    "8) Pivot into DeviceProcessEvents for full process tree analysis",
+    "9) Isolate device if malicious activity persists"
+)
 
-Check parent process → is this a LOLBin chain?
+// ---- Final Output ----
+| project
+    FirstSeen, LastSeen, DeviceName, RemoteIP, RemotePort, Count,
+    RiskLevel,
+    PortContext = metadata_comment,
+    Confidence = metadata_confidence,
+    SampleProcess, SampleCommand,
+    MITRE_Tactics, MITRE_Techniques, VT_Link, HuntingDirectives
 
-Inspect command-line for encoded payloads, URLs, or staging.
+| order by RiskLevel desc, Count desc, FirstSeen desc
+```
 
-Check signer: unsigned or unknown = suspicious.
+---
 
-Perform a VirusTotal lookup on the remote IP.
+## 🧪 Example Output
 
-Check number of events — beaconing = likely C2.
+| DeviceName | RemotePort | Process | RiskLevel | Notes |
+|------------|------------|---------|-----------|-------|
+| LAPTOP-123 | 1080 | powershell.exe | CRITICAL | Proxy/tunneling behaviour |
+| WS-04 | 1194 | unknown.exe | HIGH | Encrypted channel C2 |
+| PC-17 | 5985 | rundll32.exe | HIGH | Abnormal WinRM traffic |
 
-Correlate with DeviceProcessEvents for deeper context.
+---
 
-If behaviour persists, isolate the device and collect memory.
+## 📁 Recommended Folder Structure
 
-🛠 CPU / Cost Notes
+```
+/Threat-Hunting-Rules  
+   └── Suspicious-Ports/  
+        ├── suspicious_port_hunt.kql  
+        ├── README.md  
+        ├── samples/  
+        └── references/
+```
 
-Matching RemotePort against a scalar set is efficient.
+---
 
-Joins use small metadata tables (low cost).
+## 🎯 Need More?
 
-arg_max() prevents massive output volume.
+I can also generate:
 
-The rule uses no expensive regex on the network stream.
+- A behavioural C2 rule  
+- A QUIC/DoH detection module  
+- A GitHub index README  
+- A full supply-chain threat hunting pack  
 
-Low risk of CPU spikes; safe for continuous hunting.
-
-📄 Output Columns
-Column	Description
-DeviceName	Host involved
-RemoteIP	Suspicious destination
-RemotePort	Flagged port
-SampleProcess	The executable actually using the port
-SampleCommand	Command-line used
-MITRE_Tactics	ATT&CK mapping
-MITRE_Techniques	Exact technique
-HuntingDirectives	Analyst guidance
+Just say: **“generate companion rule”**.
