@@ -91,28 +91,3 @@ CSV feed:
 | WS-04 | 1194 | unknown.exe | HIGH | Encrypted channel C2 |
 | PC-17 | 5985 | rundll32.exe | HIGH | Abnormal WinRM traffic |
 
----
-
-## 📁 Recommended Folder Structure
-
-```
-/Threat-Hunting-Rules  
-   └── Suspicious-Ports/  
-        ├── suspicious_port_hunt.kql  
-        ├── README.md  
-        ├── samples/  
-        └── references/
-```
-
----
-
-## 🎯 Need More?
-
-I can also generate:
-
-- A behavioural C2 rule  
-- A QUIC/DoH detection module  
-- A GitHub index README  
-- A full supply-chain threat hunting pack  
-
-Just say: **“generate companion rule”**.
