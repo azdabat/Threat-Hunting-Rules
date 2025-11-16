@@ -2,59 +2,101 @@
 // Suspicious File Creation in Uncommon AppData Subdirectories
 // Author: Ala Dabat (Alstrum)
 // Purpose: Detect malware staging, DLL sideloading, script loaders, and RAT drops
-// MITRE: T1055, T1105, T1036, T1553.002, T1059.*, T1547
+// Platform: Microsoft Defender for Endpoint / Microsoft Sentinel (Advanced Hunting)
+// MITRE: T1059 (Command & Scripting), T1055 (Process Injection), 
+//        T1105 (Ingress Tool Transfer), T1036 (Masquerading),
+//        T1547 (Persistence), T1566.001 (Phishing - Attachments)
 // ============================================================================
 
-let lookback = 7d;
+let LookbackWindow = 7d;
 
 // High-risk extensions
-let SuspiciousExt = dynamic([
-    ".exe",".dll",".ps1",".psm1",".vbs",".vbe",".cmd",".bat",
-    ".hta",".scr",".cpl",".iso",".lnk",".msi"
+let SuspiciousExtensions = dynamic([
+    ".exe", ".dll", ".ps1", ".psm1", ".vbs", ".vbe", ".cmd", ".bat",
+    ".hta", ".scr", ".cpl", ".iso", ".lnk", ".msi"
 ]);
 
 // Common AppData baseline folders to EXCLUDE
-let AppDataExclusions = dynamic([
-    "\\AppData\\Local\\", 
-    "\\AppData\\LocalLow\\",
-    "\\AppData\\Roaming\\"
+let CommonAppDataFolders = dynamic([
+    "\\appdata\\local\\",
+    "\\appdata\\locallow\\",
+    "\\appdata\\roaming\\"
 ]);
 
 DeviceFileEvents
-| where Timestamp >= ago(lookback)
-| where ActionType == "Creation"
-| extend LowerPath = tolower(FolderPath)
-| where LowerPath contains "\\appdata\\"
-| where SuspiciousExt has_any (tolower(FileName))
-| where AppDataExclusions !has_any (LowerPath)   // uncommon folder
-| extend 
-    IsRandomFolder = iif(LowerPath matches regex @"appdata\\[a-z0-9]{6,}\\", 1, 0),
-    SuspiciousParent = iif(
-        InitiatingProcessFileName in~ (
-            "powershell.exe","wscript.exe","cscript.exe","mshta.exe",
+| where Timestamp >= ago(LookbackWindow)
+// MDE canonical action is usually "FileCreated"; keep "Creation" for compatibility
+| where ActionType in ("FileCreated", "Creation")
+| where isnotempty(FolderPath)
+| extend
+    LowerFolderPath = tolower(FolderPath),
+    LowerFileName   = tolower(FileName)
+| where LowerFolderPath contains "\\appdata\\"
+// File extension filter
+| extend FileExtension = tostring(extract(@"\.[a-z0-9]+$", 0, LowerFileName))
+| where FileExtension in (SuspiciousExtensions)
+// Exclude common, noisy AppData roots
+| where not(LowerFolderPath has_any(CommonAppDataFolders))
+// Behavioural enrichment
+| extend
+    RandomAppDataFolder = iif(LowerFolderPath matches regex @"\\appdata\\[a-z0-9]{6,}\\", 1, 0),
+    ParentProcessName   = tolower(tostring(InitiatingProcessFileName)),
+    SuspiciousParent    = iif(
+        ParentProcessName in~ (
+            "powershell.exe","pwsh.exe","wscript.exe","cscript.exe","mshta.exe",
             "regsvr32.exe","rundll32.exe","cmd.exe"
         ),
-        "Suspicious Parent",
-        "Normal"
-    ),
-    RiskScore = 
-          iif(IsRandomFolder == 1, 20, 0)
-        + iif(SuspiciousParent == "Suspicious Parent", 40, 0)
-        + iif(FileName endswith ".dll", 25, 0)
-        + iif(FileName endswith ".exe", 20, 0)
-        + 10
-| extend FinalRisk = case(
-    RiskScore >= 70, "CRITICAL",
-    RiskScore >= 45, "HIGH",
-    "MEDIUM"
-)
+        "SuspiciousParent",
+        "NormalParent"
+    )
+// Extension-based scoring
+| extend ExtensionScore = case(
+        FileExtension == ".dll", 25,
+        FileExtension == ".exe", 20,
+        FileExtension in (".ps1", ".psm1", ".hta", ".scr", ".cpl"), 20,
+        FileExtension in (".vbs", ".vbe", ".iso", ".msi"), 15,
+        FileExtension in (".cmd", ".bat", ".lnk"), 10,
+        5
+    )
+// Final risk scoring model
+| extend
+    BaseScore   = 10,
+    FolderScore = iif(RandomAppDataFolder == 1, 20, 0),
+    ParentScore = iif(SuspiciousParent == "SuspiciousParent", 40, 0),
+    RiskScore   = BaseScore + FolderScore + ParentScore + ExtensionScore
+| extend RiskLevel = case(
+        RiskScore >= 70, "CRITICAL",
+        RiskScore >= 45, "HIGH",
+        "MEDIUM"
+    )
 | extend HunterDirective = case(
-    FinalRisk == "CRITICAL",
-        "IMMEDIATE: High-risk file dropped in unusual AppData folder. Likely RAT, loader, or sideload DLL. Isolate host, dump process tree, check persistence.",
-    FinalRisk == "HIGH",
-        "URGENT: Suspicious process created executable/script in uncommon AppData path. Investigate initiating process + scheduled tasks.",
-    "INVESTIGATE: Validate file legitimacy. Check parent proc, user activity, and folder rarity."
-)
-| project Timestamp, DeviceName, FolderPath, FileName, InitiatingProcessFileName,
-          SuspiciousParent, IsRandomFolder, RiskScore, FinalRisk, HunterDirective
-| order by RiskScore desc;
+        RiskLevel == "CRITICAL",
+            "IMMEDIATE: High-risk binary/script dropped in uncommon AppData folder by a suspicious parent process. " +
+            "Isolate host, capture memory, dump process tree, and check for persistence (Run keys, WMI, Scheduled Tasks).",
+        RiskLevel == "HIGH",
+            "URGENT: Suspicious executable/script in non-standard AppData path. " +
+            "Review initiating process, recent user activity, and check for additional drops on the same host.",
+        "INVESTIGATE: Validate file legitimacy with the user/application owner. " +
+        "If unexpected, scope for similar files across hosts and monitor for execution."
+    )
+| extend
+    MITRETechniques = dynamic(["T1059","T1055","T1105","T1036","T1547","T1566.001"]),
+    RuleName        = "Suspicious File Creation in Uncommon AppData Subdirectories"
+// Final output schema
+| project
+    Timestamp,
+    DeviceName,
+    FolderPath,
+    FileName,
+    FileExtension,
+    ActionType,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SuspiciousParent,
+    RandomAppDataFolder,
+    RiskScore,
+    RiskLevel,
+    HunterDirective,
+    MITRETechniques,
+    RuleName
+| order by RiskScore desc, Timestamp desc;
