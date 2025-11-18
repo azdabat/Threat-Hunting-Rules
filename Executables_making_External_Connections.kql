@@ -1,0 +1,14 @@
+//Author: Ala Dabat
+// Executables making external connections Threat hunt
+// See what executables are making external connections and why, and where.
+let lookback = 14d;
+let Private = dynamic(["10.","192.168.","172.16.","172.17.","172.18.","172.19.","172.20.","172.21.","172.22.","172.23.","172.24.","172.25.","172.26.","172.27.","172.28.","172.29.","172.30.","172.31."]);
+
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("ConnectionSuccess","ConnectionInitiated")
+| where InitiatingProcessFileName endswith ".exe"
+| where isnotempty(RemoteIP) and RemoteIP !startswith_any(Private)
+| extend Proc=InitiatingProcessFileName, Cmd=tostring(InitiatingProcessCommandLine), Sha256=InitiatingProcessSHA256, Signed=InitiatingProcessSignatureStatus
+| project Timestamp,DeviceName,DeviceId,Proc,Cmd,Sha256,Signed,LocalIP,LocalPort,RemoteIP,RemotePort,RemoteUrl,RemoteIPCountry,RemoteIPASN,RemoteIPOrganization
+| order by Timestamp desc
