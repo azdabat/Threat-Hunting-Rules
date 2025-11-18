@@ -1,14 +1,27 @@
-//Author: Ala Dabat
-// Executables making external connections Threat hunt
-// See what executables are making external connections and why, and where.
-let lookback = 14d;
-let Private = dynamic(["10.","192.168.","172.16.","172.17.","172.18.","172.19.","172.20.","172.21.","172.22.","172.23.","172.24.","172.25.","172.26.","172.27.","172.28.","172.29.","172.30.","172.31."]);
+// Outbound .exe → Public IP Threat Hunt
+// Author: Ala Dabat
+// Description: Identify all outbound connections from .exe processes to public IPs with DeviceInfo enrichment.
+
+let lookback = 7d;
+let DevInfo =
+    DeviceInfo
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project DeviceId, DeviceName, OSPlatform, DeviceType, OnboardingStatus, ExposureLevel, PublicIP;
 
 DeviceNetworkEvents
 | where Timestamp >= ago(lookback)
-| where ActionType in ("ConnectionSuccess","ConnectionInitiated")
-| where InitiatingProcessFileName endswith ".exe"
-| where isnotempty(RemoteIP) and RemoteIP !startswith_any(Private)
-| extend Proc=InitiatingProcessFileName, Cmd=tostring(InitiatingProcessCommandLine), Sha256=InitiatingProcessSHA256, Signed=InitiatingProcessSignatureStatus
-| project Timestamp,DeviceName,DeviceId,Proc,Cmd,Sha256,Signed,LocalIP,LocalPort,RemoteIP,RemotePort,RemoteUrl,RemoteIPCountry,RemoteIPASN,RemoteIPOrganization
+| where RemoteIPType == "Public"
+| extend ProcName = tostring(InitiatingProcessFileName)
+| where ProcName endswith ".exe"
+| join kind=leftouter DevInfo on DeviceId
+| extend ThreatHunterDirectives = strcat(
+        "Validate outbound need for ", ProcName,
+        "; review RemoteIP=", RemoteIP,
+        " (", RemoteCountry, ")",
+        "; pivot across estate for same IP, URL or process; triage unusual countries or first-time connections."
+)
+| project Timestamp, DeviceName, DeviceType, OSPlatform, ExposureLevel, PublicIP,
+          ProcName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn,
+          RemoteIP, RemoteCountry, RemoteUrl, RemotePort,
+          ThreatHunterDirectives
 | order by Timestamp desc
