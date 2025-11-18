@@ -1,0 +1,63 @@
+/*
+Rule: High-Risk CVE Exposure on Internet-Facing Critical Assets
+Author: Ala Dabat
+Purpose: Detect exploitable critical CVEs affecting internet-facing domain controllers and high-value servers.
+*/
+
+// --- 1. Identify critical internet-facing assets ---
+let CriticalAssets =
+    DeviceInfo
+    | where IsInternetFacing == "1" or PublicIP != "" or RemoteIPCountry != "Private"
+    | where AssetValue == "High" or DeviceName has_any ("DC-","PRIDC-","MGMT-DC","CONTROLLER","PRD-","JUMP-","FIN-","SQL-PRD")
+    | extend AssetTag = case(
+        DeviceName has_any ("DC-","PRIDC-","MGMT-DC","CONTROLLER"), "DomainController",
+        AssetValue == "High" or DeviceName has_any ("PRD-","JUMP-","FIN-","SQL-PRD"), "CriticalServer",
+        "InternetFacing"
+    )
+    | project DeviceName, AssetTag;
+
+// --- 2. Join Critical Assets to exploitable Critical CVEs ---
+let VulnData =
+    DeviceTvmSoftwareVulnerabilities
+    | where VulnerabilitySeverityLevel contains "Critical"
+    | join kind=inner (
+        DeviceTvmSoftwareVulnerabilitiesKB
+        | where IsExploitAvailable == 1
+        | project CveId, CvssScore, VulnerabilityDescription,
+                  IsExploitAvailable, RecommendedSecurityUpdate, OSPlatform
+    ) on CveId
+    | join kind=inner CriticalAssets on DeviceName;
+
+// --- 3. Aggregate by CVE ---
+VulnData
+| summarize
+    VulnerableDevices = make_set(DeviceName),
+    AssetTags = make_set(AssetTag),
+    MaxCvssScore = max(todouble(CvssScore)),
+    VulnerabilityDescription = any(VulnerabilityDescription),
+    IsExploitAvailable = any(IsExploitAvailable),
+    RecommendedSecurityUpdate = any(RecommendedSecurityUpdate),
+    OSPlatform = any(OSPlatform)
+    by CveId
+
+// --- 4. Dynamic contextual risk score ---
+| extend BaseCvss = MaxCvssScore * 10
+| extend AssetScore = case(
+        AssetTags contains "DomainController", 100,
+        AssetTags contains "CriticalServer", 50,
+        10
+    )
+| extend ExploitScore = iif(IsExploitAvailable == 1, 50, 0)
+| extend RiskScore = round(BaseCvss + AssetScore + ExploitScore)
+
+// --- 5. Single-line triage directive ---
+| extend TotalDevices = array_length(VulnerableDevices)
+| extend Directive = case(
+    RiskScore > 180, "CRITICAL: Immediately isolate affected hosts, emergency patch, alert IR/CISO.",
+    RiskScore between (120) and (180), "HIGH: Patch within 24h, validate WAF/IPS coverage, raise high-priority ticket.",
+    "MEDIUM: Add to next patching cycle (≤7 days)."
+)
+
+// --- 6. FINAL OUTPUT (ALL ON ONE LINE) ---
+| project RiskScore, Directive, TotalDevices, CveId, VulnerabilitySeverityLevel = iff(MaxCvssScore >= 9, "Critical", "High"), CvssScore = MaxCvssScore, VulnerabilityDescription, IsExploitAvailable, RecommendedSecurityUpdate, OSPlatform, VulnerableDevices, AssetTags
+| order by RiskScore desc
