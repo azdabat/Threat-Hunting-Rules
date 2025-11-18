@@ -1,0 +1,48 @@
+//*Rule Name: NTLM Hash Exposure on High-Value Assets
+Author: Ala Dabat
+Version: 1.1
+Date: 2025-11-18
+Description: Identifies ExposureGraph edges where an Asset (server/machine) is found to possess an NTLM hash 
+             belonging to a sensitive identity. It prioritizes exposures involving Domain Controllers 
+             and highly privileged accounts (e.g., krbtgt, administrators).
+References: MITRE T1552.001 (Credentials from Configuration Files)
+*//
+
+ExposureGraphEdges
+    // 1. Filter on the relationship and ensure the source is an Asset (Server/Machine)
+    | where EdgeLabel has "has credentials of"
+    | where SourceNodeLabel == "Asset"
+    
+    // 2. Extract and confirm NTLM hash exposure
+    | extend parsedData = parse_json(EdgeProperties)
+    | extend NTLMHashExposed = tostring(parsedData.rawData.ntlmHash.ntlmHash)
+    | where NTLMHashExposed == "true"
+    
+    // 3. Join with Identity Info to prioritize sensitive accounts (including high-value names)
+    | join kind=inner (
+        IdentityInfo
+        | where Tags has "Sensitive" 
+          or AccountDisplayName has_any ("svc_domain_admin", "krbtgt", "administrator") // Prioritize specific high-value accounts
+        | project AccountDisplayName, Tags
+    )
+    on $left.TargetNodeName == $right.AccountDisplayName
+    
+    // 4. Add actionable directives for the threat hunter
+    | extend **Severity** = iff(SourceNodeName has_any ("DC", "DomainController"), "CRITICAL", "HIGH")
+    | extend **Directive** = case(
+            Severity == "CRITICAL", "**1. Isolate the source machine immediately**; 2. Force reset of the exposed account's (TargetNodeName) password; 3. Perform memory analysis on the source machine.",
+            Severity == "HIGH", "1. Force reset of the exposed account's (TargetNodeName) password; 2. Initiate forensic acquisition of the source machine's (SourceNodeName) disk.",
+            "Review alert manually."
+        )
+
+    // 5. Final output for the SOC Analyst
+    | project 
+        Severity, 
+        Directive, 
+        SourceNodeName, 
+        SourceNodeLabel, 
+        TargetNodeName, 
+        AccountDisplayName, 
+        Tags,
+        ingestion_timestamp
+    | order by Severity desc
