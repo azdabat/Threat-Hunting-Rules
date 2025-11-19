@@ -3,14 +3,13 @@
 Rule: First-Time or Rare Inbound Remote Access
 Author: Ala Dabat
 Purpose:
-  Detect new or unusually rare inbound activity:
-   - First-time VPN, RDP, SSH, SMB inbound
+  Detects:
+   - First-time or unusual inbound VPN, RDP, SSH, SMB
    - First-time RMM activity (AnyDesk, ScreenConnect, RustDesk…)
-   - Bad ASN / hosting provider sources
-   - New country or unusual geolocation
-   - Rare activity (≤3 occurrences in 30 days)
-Mapped MITRE:
-  T1133, T1021.*, T1090, T1105
+   - Inbound connections from suspicious hosting providers (OVH, M247…)
+   - New geolocation / new country
+   - Low-frequency inbound connections (<=3 in 30 days)
+MITRE: T1133, T1021.*, T1090, T1105
 =====================================================================
 */
 
@@ -21,9 +20,9 @@ let LowFrequencyThreshold = 3;
 let AllowedCountries = dynamic(["GB","UK"]);
 let AllowedIPs = dynamic(["1.1.1.1"]);
 let VpnPorts = dynamic([500,4500,1701,1194,51820]);
-let AdminPorts = dynamic([3389,22,445]);    // RDP, SSH, SMB
+let AdminPorts = dynamic([3389,22,445]);
 let RmmIndicators = dynamic(["anydesk","screenconnect","rustdesk","supremo","teamviewer","splashtop","kaseya"]);
-let BadASNList = dynamic(["ovh","hetzner","contabo","m247","digitalocean","linode","proton","nord"]);
+let BadProviders = dynamic(["ovh","hetzner","contabo","m247","digitalocean","linode","proton","nord"]);
 
 //// BASELINE – 30 DAYS ////
 let HistoricalInbound =
@@ -61,16 +60,17 @@ CurrentInbound
     | summarize arg_max(Timestamp, *) by DeviceId
     | project DeviceId, GeoCountry, ISP
 ) on DeviceId
+
 | extend Country = tostring(GeoCountry),
-         ASN = tolower(tostring(ISP)),
+         Provider = tolower(tostring(ISP)),
          UrlLower = tolower(RemoteUrl),
          ProcLower = tolower(ProcName)
 
-//// CLASSIFIERS (Clear Naming) ////
+//// CLASSIFIERS (Human-Named) ////
 | extend IsVPNPort = iif(LocalPort in (VpnPorts), 1, 0),
          IsAdminAccess = iif(LocalPort in (AdminPorts), 1, 0),
          IsRMMAccess = iif(ProcLower has_any (RmmIndicators) or UrlLower has_any (RmmIndicators), 1, 0),
-         IsBadASN = iif(ASN has_any (BadASNList), 1, 0),
+         IsBadProvider = iif(Provider has_any (BadProviders), 1, 0),
          IsNewCountry = iif(Country !in (AllowedCountries) and isnotempty(Country), 1, 0),
          IsUnapprovedIP = iif(RemoteIP !in (AllowedIPs), 1, 0);
 
@@ -79,26 +79,27 @@ CurrentInbound
         iif(IsAdminAccess == 1, 30, 0) +
         iif(IsVPNPort == 1, 20, 0) +
         iif(IsRMMAccess == 1, 25, 0) +
-        iif(IsBadASN == 1, 20, 0) +
+        iif(IsBadProvider == 1, 20, 0) +
         iif(IsNewCountry == 1, 25, 0) +
         iif(FirstTimeSeen, 20, 0) +
         iif(LowFrequency, 10, 0) +
         iif(IsUnapprovedIP == 1, 10, 0) +
         iif(ExposureLevel == "High", 15, 0);
 
-//// HUNTER DIRECTIVES (Human-Readable) ////
+//// HUNTER NOTES (Human Language) ////
 | extend HunterNotes = case(
       Score >= 70,
-        "CRITICAL: First-time or rare inbound access from high-risk ASN/country or RMM/VPN. Investigate DeviceTimeline ±2 hours, check parallel sessions, confirm if authorised. If unknown: isolate.",
+        "CRITICAL: First-time or rare inbound access from high-risk provider or RMM/VPN. Review DeviceTimeline ±2h and confirm legitimacy. If unexpected: isolate.",
       Score between (40 .. 69),
-        "HIGH: New or low-frequency inbound connection. Validate whether expected. Pivot into process tree and related identity activity.",
-      "MEDIUM: New inbound IP for this host. Build baseline and monitor for expansion."
+        "HIGH: New or low-frequency inbound access. Validate expected behaviour; pivot into process tree and identity activity.",
+      "MEDIUM: New inbound IP for this host. Baseline and monitor."
 )
 
 //// OUTPUT ////
-| project Timestamp, DeviceName, DeviceId, RemoteIP, LocalPort, Country, ASN,
+| project Timestamp, DeviceName, DeviceId, RemoteIP, LocalPort,
+          Country, Provider,
           ProcName, ProcCmd,
           FirstTimeSeen, LowFrequency,
-          IsVPNPort, IsAdminAccess, IsRMMAccess, IsBadASN, IsNewCountry,
+          IsVPNPort, IsAdminAccess, IsRMMAccess, IsBadProvider, IsNewCountry,
           Score, HunterNotes
 | order by Score desc, Timestamp desc
