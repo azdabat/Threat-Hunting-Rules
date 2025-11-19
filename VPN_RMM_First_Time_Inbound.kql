@@ -5,11 +5,10 @@ Author: Ala Dabat
 Purpose:
   Detects:
    - First-time or unusual inbound VPN, RDP, SSH, SMB
-   - First-time RMM activity (AnyDesk, ScreenConnect, RustDesk…)
-   - Inbound connections from suspicious hosting providers (OVH, M247…)
-   - New geolocation / new country
+   - First-time RMM use (AnyDesk, ScreenConnect, RustDesk…)
+   - New geolocation / country
    - Low-frequency inbound connections (<=3 in 30 days)
-MITRE: T1133, T1021.*, T1090, T1105
+MITRE: T1133, T1021.*, T1105
 =====================================================================
 */
 
@@ -20,9 +19,8 @@ let LowFrequencyThreshold = 3;
 let AllowedCountries = dynamic(["GB","UK"]);
 let AllowedIPs = dynamic(["1.1.1.1"]);
 let VpnPorts = dynamic([500,4500,1701,1194,51820]);
-let AdminPorts = dynamic([3389,22,445]);
+let AdminPorts = dynamic([3389,22,445]); 
 let RmmIndicators = dynamic(["anydesk","screenconnect","rustdesk","supremo","teamviewer","splashtop","kaseya"]);
-let BadProviders = dynamic(["ovh","hetzner","contabo","m247","digitalocean","linode","proton","nord"]);
 
 //// BASELINE – 30 DAYS ////
 let HistoricalInbound =
@@ -54,52 +52,43 @@ CurrentInbound
     | project DeviceId, DeviceName, OSPlatform, ExposureLevel
 ) on DeviceId
 
-//// GEO + ISP CONTEXT ////
-| join kind=leftouter (
-    DeviceNetworkInfo
-    | summarize arg_max(Timestamp, *) by DeviceId
-    | project DeviceId, GeoCountry, ISP
-) on DeviceId
-
-| extend Country = tostring(GeoCountry),
-         Provider = tolower(tostring(ISP)),
-         UrlLower = tolower(RemoteUrl),
+//// GEO CONTEXT (VALID MDE FIELD) ////
+| extend Country = tostring(GeoCountry)
+| extend UrlLower = tolower(RemoteUrl),
          ProcLower = tolower(ProcName)
 
-//// CLASSIFIERS (Human-Named) ////
+//// CLASSIFIERS (All Valid Fields) ////
 | extend IsVPNPort = iif(LocalPort in (VpnPorts), 1, 0),
          IsAdminAccess = iif(LocalPort in (AdminPorts), 1, 0),
          IsRMMAccess = iif(ProcLower has_any (RmmIndicators) or UrlLower has_any (RmmIndicators), 1, 0),
-         IsBadProvider = iif(Provider has_any (BadProviders), 1, 0),
          IsNewCountry = iif(Country !in (AllowedCountries) and isnotempty(Country), 1, 0),
          IsUnapprovedIP = iif(RemoteIP !in (AllowedIPs), 1, 0);
 
-//// SCORING (Human-Reasoned) ////
+//// SCORING ////
 | extend Score =
         iif(IsAdminAccess == 1, 30, 0) +
         iif(IsVPNPort == 1, 20, 0) +
         iif(IsRMMAccess == 1, 25, 0) +
-        iif(IsBadProvider == 1, 20, 0) +
         iif(IsNewCountry == 1, 25, 0) +
         iif(FirstTimeSeen, 20, 0) +
         iif(LowFrequency, 10, 0) +
         iif(IsUnapprovedIP == 1, 10, 0) +
         iif(ExposureLevel == "High", 15, 0);
 
-//// HUNTER NOTES (Human Language) ////
+//// HUNTER NOTES ////
 | extend HunterNotes = case(
       Score >= 70,
-        "CRITICAL: First-time or rare inbound access from high-risk provider or RMM/VPN. Review DeviceTimeline ±2h and confirm legitimacy. If unexpected: isolate.",
+        "CRITICAL: First-time or rare inbound access using RMM/VPN or admin protocol. Review DeviceTimeline ±2h and confirm if expected. If unknown: isolate.",
       Score between (40 .. 69),
-        "HIGH: New or low-frequency inbound access. Validate expected behaviour; pivot into process tree and identity activity.",
-      "MEDIUM: New inbound IP for this host. Baseline and monitor."
+        "HIGH: New or low-frequency inbound access. Validate behaviour and pivot into process/identity activity.",
+      "MEDIUM: New inbound source for this device. Baseline and monitor."
 )
 
 //// OUTPUT ////
 | project Timestamp, DeviceName, DeviceId, RemoteIP, LocalPort,
-          Country, Provider,
+          Country, 
           ProcName, ProcCmd,
           FirstTimeSeen, LowFrequency,
-          IsVPNPort, IsAdminAccess, IsRMMAccess, IsBadProvider, IsNewCountry,
+          IsVPNPort, IsAdminAccess, IsRMMAccess, IsNewCountry,
           Score, HunterNotes
 | order by Score desc, Timestamp desc
