@@ -1,7 +1,7 @@
 // ============================================================================
 // Suspicious Certificates with Zero KeySize or Missing Signature Algorithm
 // Detects malformed, corrupted, or attacker-injected certificates.
-// Author: Ala Dabat (Alstrum)
+// Author: Ala Dabat 
 // MITRE: T1553.002 (Subvert Trust Controls), T1547.006 (Driver Load Persistence),
 //        T1484 (Domain Trust Abuse), T1562.001 (Defense Evasion)
 // ============================================================================
