@@ -1,17 +1,12 @@
-// =====================================================================================================
-// Browser Extension Hunt — Low CPU Native Hunt 
+////////////////////////////////////////////////////////////////////////////////////////
+// Browser Extension Installation Hunt — Low CPU Native
+// Rule Title: Browser_Extension_Install_Surface
 // Author: Ala Dabat
-// Description:
-//   Raw surface for threat hunters. Surfaces any extension installation artifact
-//   (CRX, folder create, manifest write, forced policy install).
-//   No TI, no rarity, minimal joins, no summarise. Clean and fast.
-// -----------------------------------------------------------------------------------------------------
-// CPU Notes:
-//   - Very low CPU: no environment-wide dcount, no scoring, no rarity evaluation.
-//   - DeviceInfo join is lightweight.
-//   - No summarise unless hunter adds one manually.
-//   - Suitable for large tenants. Returns raw events for pivoting.
-// =====================================================================================================
+// Version: 2025-11
+// Category: Persistence / Initial Access
+// Description: Surfaces extension installation behaviour for raw threat hunting.
+// Telemetry: DeviceFileEvents, DeviceRegistryEvents, DeviceInfo
+////////////////////////////////////////////////////////////////////////////////////////
 
 let lookback = 7d;
 
@@ -21,7 +16,7 @@ DeviceFileEvents
 | where FileName endswith ".crx" and ActionType == "FileCreated"
 | extend ExtensionID = tolower(extract(@"([a-z]{32})",1,FileName))
 | where isnotempty(ExtensionID)
-| extend InstallMethod="CRXInstaller";
+| extend InstallMethod = "CRXInstaller";
 
 let Folder_Events =
 DeviceFileEvents
@@ -30,7 +25,7 @@ DeviceFileEvents
 | where FolderPath has @"\User Data\" and FolderPath has @"\Extensions\"
 | extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
 | where isnotempty(ExtensionID)
-| extend InstallMethod="ExtensionFolder";
+| extend InstallMethod = "ExtensionFolder";
 
 let Manifest_Events =
 DeviceFileEvents
@@ -38,7 +33,7 @@ DeviceFileEvents
 | where FileName =~ "manifest.json" and FolderPath has @"\Extensions\"
 | extend ExtensionID = tolower(extract(@"\\Extensions\\([a-z]{32})\\",1,FolderPath))
 | where isnotempty(ExtensionID)
-| extend InstallMethod="ManifestWrite";
+| extend InstallMethod = "ManifestWrite";
 
 let Policy_Events =
 DeviceRegistryEvents
@@ -46,11 +41,37 @@ DeviceRegistryEvents
 | where RegistryKey has "ExtensionInstallForcelist"
 | extend ExtensionID = tolower(extract(@"([a-z]{32})",1,tostring(RegistryValueData)))
 | where isnotempty(ExtensionID)
-| extend InstallMethod="PolicyForceInstall";
+| extend InstallMethod = "PolicyForceInstall";
 
-union CRX_Events, Folder_Events, Manifest_Events, Policy_Events
-| join kind=leftouter (DeviceInfo | project DeviceId, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags) on DeviceId
-| extend InstallingProcessName    = InitiatingProcessFileName,
-         InstallingProcessCommand = InitiatingProcessCommandLine
-| project Timestamp,DeviceName,OSPlatform,DeviceCategory,ExposureLevel,DeviceTags,InstallMethod,ExtensionID,FileName,FolderPath,RegistryKey,RegistryValueData,InstallingProcessName,InstallingProcessCommand,SHA256
+let RawEvents = union CRX_Events, Folder_Events, Manifest_Events, Policy_Events;
+
+RawEvents
+| join kind=leftouter (
+    DeviceInfo
+    | project DeviceId, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags
+) on DeviceId
+| extend MITRE_Technique = case(
+        InstallMethod == "PolicyForceInstall", "T1176;T1546",
+        InstallMethod == "ManifestWrite",      "T1176;T1059",
+        InstallMethod == "CRXInstaller",       "T1176",
+        InstallMethod == "ExtensionFolder",    "T1176",
+        "T1176"
+    )
+| extend RiskScore = case(
+        InstallMethod == "PolicyForceInstall", 3,
+        InstallMethod == "ManifestWrite",      2,
+        InstallMethod == "CRXInstaller",       1,
+        InstallMethod == "ExtensionFolder",    1,
+        0
+    )
+| extend ThreatHunterDirective = case(
+        RiskScore == 3, "CRITICAL: Forced extension install detected. Verify GPO, confirm admin activity, check for policy abuse.",
+        RiskScore == 2, "HIGH: manifest.json modification detected. Inspect extension folder and initiating process lineage.",
+        RiskScore == 1 and InstallMethod == "CRXInstaller", "MEDIUM: CRX installer triggered. Confirm user intent and review originating process.",
+        RiskScore == 1 and InstallMethod == "ExtensionFolder", "MEDIUM: Extension folder creation observed. Check for silent installs or installer behaviour.",
+        "INFO: Review if user reports browser anomalies."
+    )
+| project Timestamp, DeviceName, OSPlatform, DeviceCategory, ExposureLevel, DeviceTags, InstallMethod, ExtensionID, FileName, FolderPath, RegistryKey, RegistryValueData, InstallingProcessName=InitiatingProcessFileName, InstallingProcessCommand=InitiatingProcessCommandLine, SHA256, MITRE_Technique, RiskScore, ThreatHunterDirective
 | order by Timestamp desc
+
+// Project: LOLBins_Chrome_Extension_Surface_Detection
