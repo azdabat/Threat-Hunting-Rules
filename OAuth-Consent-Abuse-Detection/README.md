@@ -1,133 +1,126 @@
-# 🔐 OAuth Consent Abuse Detection Rule (Microsoft Sentinel)
-**Author:** Ala Dabat  
-**Version:** 2025-11  
-**Detection Type:** Cloud Persistence / Initial Access  
-**MITRE ATT&CK:**  
-- **TA0001 – Initial Access**  
-- **TA0003 – Persistence**  
-- **T1550.001 – OAuth Token Abuse**
+# OAuth Consent Abuse Detection Rule (Microsoft Sentinel)
+Author: Ala Dabat  
+Version: 2025-11  
+Detection Type: Cloud Persistence / Initial Access  
+MITRE ATT&CK: TA0001 | TA0003 | T1550.001
 
 ---
 
-## 🧠 Overview
-Modern attacks increasingly abuse **OAuth consent flows** instead of passwords or malware.  
-Threat actors no longer need a foothold inside the network — they simply request high-risk permissions, gain consent, and operate with *Microsoft Graph API access*.
+## Overview
+Abuse of OAuth consent flows has become a reliable way for attackers to gain persistent access to Microsoft 365 environments without needing credentials or endpoint footholds. This rule focuses on identifying malicious consent activity, privilege escalation through high-risk Graph API scopes, and post-consent token behaviour that indicates longer-term access or exfiltration.
 
-This rule provides **full-stack detection** for:
+The detection covers:
 
-- Malicious OAuth consent  
+- Malicious or suspicious consent events  
 - High-risk Graph permissions  
-- Non-Microsoft publishers  
-- Suspicious user-agents  
-- Token re-use & refresh-token abuse  
-- Service principal sign-ins  
-- Tenant-wide admin consent  
-- App-only (client credential) persistence  
-- Offline access tokens (**infinite persistence**)  
+- Unknown or non-Microsoft publishers  
+- Suspicious user-agents during authentication  
+- Token replay and refresh-token abuse  
+- Service principal sign-ins (app-only persistence)  
+- Admin consent events  
+- offline_access infinite persistence
 
 ---
 
-## 🛡 Real-World Attack Coverage
+## Real-World Attack Coverage
 
-### ✔ **SolarWinds / UNC2452**
-**Tactic:** OAuth app persistence + admin consent + Graph API exfiltration  
-**Coverage:**  
-- Detects malicious OAuth grants  
-- Detects app-only “client credential” backdoor  
-- Detects post-consent Graph API token activity  
-- Detects non-Microsoft publisher + unusual user agents  
+### SolarWinds / UNC2452
+Technique: OAuth app persistence, admin consent, Graph exfiltration  
+Coverage:
+- Flags malicious consent  
+- Detects app-only credential backdoors  
+- Identifies Graph API usage after consent  
+- Highlights non-Microsoft publishers and unusual user-agents
 
-### ✔ **3CX Supply Chain (APT41)**
-**Tactic:** OAuth token re-use + credential manipulation  
-**Coverage:**  
-- Token replay (TokenUseCount > 0)  
-- Suspicious UA + IP pivot  
-- Offline_access persistence  
+### 3CX Supply Chain (APT41)
+Technique: OAuth token reuse and credential manipulation  
+Coverage:
+- Detects token replay via TokenUseCount  
+- Correlates suspicious user-agents and IP pivots  
+- Identifies offline_access persistence
 
-### ✔ **Midnight Blizzard (NOBELIUM) 2024–2025**
-**Tactic:** Creating malicious apps, granting Mail.Read, Mail.Send, offline_access  
-**Coverage:**  
-✔ HighRiskPermissionCount  
-✔ Suspicious Publisher  
-✔ App-only authentication  
-✔ Token replay from foreign IPs  
+### Midnight Blizzard (NOBELIUM) 2024–2025
+Technique: Malicious apps requesting Mail.Read, Mail.Send, offline_access  
+Coverage:
+- Scores high-risk permissions  
+- Flags suspicious publishers  
+- Detects app-only authentication  
+- Identifies token replay from unusual geography
 
 ---
 
-## 🔎 Detection Logic Summary
-The rule builds detections from 4 telemetry layers:
+## Detection Logic Summary
 
-### **1) Consent Events (AuditLogs)**
-- App created  
-- Permissions granted  
-- Who approved  
-- Publisher  
-- Consent context  
+### 1. Consent Events (AuditLogs)
+- Application creation  
+- Permission grants  
+- Consent initiator  
+- Publisher reputation  
+- Scope evaluation and risk weighting
 
-### **2) Token Issuance (TokenIssuanceLogs)**
+### 2. Token Issuance (TokenIssuanceLogs)
 - Token replay  
-- Refresh token usage  
-- Token flood patterns  
+- Refresh-token usage  
+- Flood patterns and excessive issuance
 
-### **3) Graph Sign-ins (SigninLogs)**
-- Unauthorized graph calls  
-- Impossible travel API access  
+### 3. Graph Sign-ins (SigninLogs)
+- Graph API access anomalies  
+- Impossible travel and foreign pivots
 
-### **4) Service Principal Sign-ins**
-- Machine-level persistence  
-- App-only exfiltration  
-
----
-
-## 📊 Scoring Breakdown
-
-| Component | Weight |
-|----------|--------|
-| High-risk permissions | +1 each |
-| Admin Consent | +2 |
-| App-only (client credential) | +2 |
-| Suspicious User Agent | +1 |
-| Unknown App | +1 |
-| Unknown Publisher | +1 |
-| Token Re-Use / SP Sign-ins | +2 |
-
-Final output: **RiskScore** sorted highest-first.
+### 4. Service Principal Sign-ins
+- Machine-level app-only persistence  
+- API activity without user context
 
 ---
 
-## 📣 Hunter Directives (Auto-Generated)
+## Scoring Breakdown
 
-Each alert includes a fully-generated SOC response block:
+Component | Weight
+---------|-------
+High-risk permissions | +1 each
+Admin consent | +2
+App-only authentication | +2
+Suspicious user-agent | +1
+Unknown application | +1
+Unknown publisher | +1
+Token replay or SP sign-ins | +2
 
-```
-OAuth Consent Hunt Alert: App '<AppDisplayName>' granted <N> high-risk permissions.
-- Consent: <Admin/User> | Grant: <Delegate/AppOnly>
-- Initiator + IP: <User> from <IP>
-- TokenUse: <Count> | SPCalls: <Count>
-- RiskScore: <Score>
-------------------------------
+Final output sorts descending by RiskScore.
+
+---
+
+## Hunter Directives
+
+Each alert generates a structured response block:
+
+OAuth Consent Investigation: Application '<AppDisplayName>' granted <N> high-risk permissions.  
+Consent Type: <Admin/User> | Grant: <Delegate/AppOnly>  
+Initiator and IP: <User> from <IP>  
+TokenUse: <Count> | SP Sign-ins: <Count>  
+RiskScore: <Score>
+
 Analyst Actions:
-1. Confirm if user truly approved this consent
-2. Investigate AppID and publisher reputation
-3. Pivot on IP & UserAgent for anomalies
-4. Review permissions granted
-5. Check token usage & SP sign-ins
-6. Revoke app access if malicious
-7. Force password reset if compromise suspected
-```
+1. Confirm whether the user intentionally approved the consent.  
+2. Investigate AppID and publisher reputation.  
+3. Pivot on IP address and user-agent.  
+4. Review full permission list and risk level.  
+5. Evaluate token usage, refresh-token activity, and SP sign-ins.  
+6. Revoke application access if malicious.  
+7. Reset credentials if compromise is suspected.
 
 ---
 
-## 🧪 Lab Testing Recommendations
-To validate rule performance:
+## Lab Testing Guidance
+
+For controlled validation:
 
 - Create a dummy Azure app  
-- Grant *Mail.Read* or *Files.ReadWrite.All*  
-- Perform Graph API calls  
-- Test with python, curl, and postman  
-- Observe RiskScore growth and token replay detection  
+- Grant permissions such as Mail.Read or Files.ReadWrite.All  
+- Perform Graph API calls using Python, curl, or Postman  
+- Observe RiskScore behaviour, token replay, and SP sign-in logging  
+
 ---
 
-## 📬 Contact
-For detection engineering, threat modeling, or threat intelligence collaboration:  
-**GitHub:** https://github.com/azdabat
+## Contact
+Detection engineering, threat modelling, or collaboration:  
+GitHub: https://github.com/azdabat
