@@ -1,93 +1,94 @@
-# 📘 Suspicious Port Threat Hunting Rule  
-### High-Fidelity Network Port Detection Using External Intelligence + Full Process Attribution  
-**Author:** Ala Dabat  
-**Updated:** 2025-11-14  
+# Suspicious Port Threat Hunting Rule
+### High-Fidelity Network Port Detection with External Intelligence and Full Process Attribution
+Author: Ala Dabat  
+Updated: 2025-11-14  
 
 ---
 
-## 🚀 Purpose
+## Purpose
 
-This rule identifies network connections using **suspicious or malicious ports** sourced from an external intelligence CSV feed, and correlates them with **real process telemetry**, including:
+This rule detects outbound network connections over suspicious or malicious ports sourced from an external intelligence feed, and correlates them with full process-level telemetry. It is designed to expose high-risk outbound behaviour, encrypted tunnels, disguised C2 channels, and malicious binaries attempting to blend into legitimate traffic.
+
+The rule enriches each match with:
 
 - Executable name  
 - Command-line  
 - SHA256  
 - Parent process  
-- Signer  
+- Signer information  
 - User context  
-- MITRE ATT&CK mapping  
-- Risk scoring  
+- MITRE technique mapping  
+- Dynamic risk scoring  
 - Analyst hunting directives  
 
-Designed for **SOC L2.5–L3**, **Threat Hunters**, and **CTI analysts**.
+Suitable for SOC L2.5–L3 analysts, threat hunters, and CTI teams.
 
 ---
 
-## 🧠 Detection Summary
+## Detection Summary
 
-### ✔ What This Rule Detects
-- Suspicious outbound ports flagged by open-source TI  
-- Malware beaconing over rare or disguised ports  
-- Unsigned / malicious binaries making outbound connections  
-- Supply-chain malware C2 behaviour (3CX, SolarWinds, F5)  
-- Encrypted proxy tunnels (SOCKS, OpenVPN)  
-- LOLBins establishing network sessions  
+### What This Rule Detects
+- Suspicious outbound ports defined by open-source threat intelligence  
+- Malware beaconing through rare or non-standard ports  
+- Unsigned or untrusted binaries making outbound connections  
+- Supply-chain style C2 behaviour seen in 3CX, SolarWinds, F5 intrusions  
+- Encrypted tunnels (SOCKS, OpenVPN, custom proxy tooling)  
+- LOLBins generating outbound network traffic  
 - Multi-stage loaders communicating through uncommon ports  
 
-### ❌ What This Rule Does *NOT* Detect
+### What This Rule Does Not Detect
 
 | Not Detected | Reason |
 |--------------|--------|
-| Malware with no network activity | No connections = no trigger |
-| C2 over ports 80/443 | Requires behavioural rules |
-| QUIC-based C2 | Encrypted UDP hides ports |
-| DNS-over-HTTPS C2 | Hidden behind HTTPS |
-| Port knocking | Needs sequential logic |
-| Localhost C2 | Intentionally excluded |
+| Malware with no network activity | No traffic = no signal |
+| C2 using 80/443 | Behaviour-based checks required |
+| QUIC-based C2 | UDP encryption conceals ports |
+| DNS-over-HTTPS C2 | Hidden inside HTTPS |
+| Port knocking sequences | Needs stateful logic |
+| Localhost-only C2 | Local connections intentionally excluded |
 
 ---
 
-## 📡 Data Sources
+## Data Sources
 
 | Table | Purpose |
 |-------|---------|
-| **DeviceNetworkEvents** | Outbound network connections |
-| **DeviceProcessEvents** | Enriched process telemetry |
-| **External CSV Feed** | Suspicious ports & metadata |
+| DeviceNetworkEvents | Outbound network traffic |
+| DeviceProcessEvents | Process and command-line attribution |
+| External CSV Feed | Suspicious port metadata |
 
-CSV feed:  
-`https://github.com/mthcht/awesome-lists/blob/main/Lists/suspicious_ports_list.csv`
+External CSV source:  
+https://github.com/mthcht/awesome-lists/blob/main/Lists/suspicious_ports_list.csv
 
 ---
 
-## 🧩 MITRE ATT&CK Mapping
+## MITRE ATT&CK Mapping
 
 | Tactic | Technique | Description |
 |--------|-----------|-------------|
-| **TA0011** | **T1071** | Application Layer C2 |
-| | **T1090** | Proxy/Tunneling |
-| | **T1573** | Encrypted channel |
+| TA0011 | T1071 | Application Layer C2 |
+| TA0011 | T1090 | Proxy/Tunneling |
+| TA0011 | T1573 | Encrypted communication channel |
 
 ---
 
-## 🕵️‍♂️ Analyst Hunting Directives
+## Analyst Hunting Directives
 
-1. Identify the executable creating the suspicious connection.  
-2. Investigate parent process (LOLBins often spawn C2).  
-3. Inspect command-line arguments for downloads or encoded payloads.  
-4. Review SHA256 and signer reputation.  
-5. Check frequency of connections → beaconing patterns.  
-6. Perform VirusTotal lookup on destination IP.  
-7. Check user session ownership.  
-8. If malicious → isolate host and collect memory.
+1. Identify the executable responsible for the suspicious network connection.  
+2. Review the parent process to catch LOLBin-driven C2 activity.  
+3. Inspect full command-line arguments for encoded or download-related parameters.  
+4. Evaluate SHA256 and signer reputation.  
+5. Check connection patterns for regular intervals (beaconing).  
+6. Run a threat-intel lookup on the destination IP or hostname.  
+7. Validate the user session and associated privilege level.  
+8. If activity is malicious or unexplained, isolate the host and perform memory capture.  
 
 ---
 
-## 🧪 Example Output
+## Example Output
 
 | DeviceName | RemotePort | Process | RiskLevel | Notes |
 |------------|------------|---------|-----------|-------|
-| LAPTOP-123 | 1080 | powershell.exe | CRITICAL | Proxy/tunneling behaviour |
-| WS-04 | 1194 | unknown.exe | HIGH | Encrypted channel C2 |
-| PC-17 | 5985 | rundll32.exe | HIGH | Abnormal WinRM traffic |
-
+| LAPTOP-123 | 1080 | powershell.exe | CRITICAL | Behaviour aligned with proxy/tunneling activity |
+| WS-04 | 1194 | unknown.exe | HIGH | Encrypted channel indicative of C2 |
+| PC-17 | 5985 | rundll32.exe | HIGH | Abnormal WinRM-based traffic |
