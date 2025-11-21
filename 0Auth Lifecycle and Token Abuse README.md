@@ -1,4 +1,4 @@
-# 🛡️ OAuth Consent Abuse Threat Hunt (Production Rule)
+#  OAuth Consent Abuse Threat Hunt (Production Rule)
 
 > **Author**: AlA Dabat  
 > **Date**: November 2025  
@@ -14,7 +14,7 @@
 
 ---
 
-## 📌 Overview
+##  Overview
 
 This KQL threat hunt rule surfaces **all OAuth app consent events** over a 30-day period, correlates them with token usage and service principal activity, and applies confidence scoring to highlight **high-risk delegated and application permissions**.
 
@@ -28,7 +28,7 @@ It includes:
 
 ---
 
-## 🎯 Detection Goals
+## Detection Goals
 
 - Identify **overly permissive OAuth grants** (e.g., `Application.ReadWrite.All`, `Mail.ReadWrite`, `Files.ReadWrite.All`)
 - Highlight **first-time or rare consent events**
@@ -38,7 +38,7 @@ It includes:
 
 ---
 
-## 🧠 Confidence Scoring (RiskScore)
+##  Confidence Scoring (RiskScore)
 
 The `RiskScore` column is derived using:
 
@@ -55,7 +55,7 @@ The `RiskScore` column is derived using:
 
 ---
 
-## 👨‍💻 Hunter Directives
+##  Hunter Directives
 
 The `HuntingDirectives` field provides contextual actions, for example:
 
