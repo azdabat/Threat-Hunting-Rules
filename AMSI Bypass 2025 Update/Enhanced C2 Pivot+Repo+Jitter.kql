@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////////////////////
 // Rule: Suspicious_Ports_Jitter_Beaconing
 // Author: Ala Dabat
-// Version: 2025-11
+// Version: 2025-11 (Not peoduction tested/ready)
 // Purpose: Detect suspicious outbound connections on ports from an external feed,
 //          enriched with process attribution and hybrid jitter/beacon analysis.
 // Feed: https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv
