@@ -11,13 +11,11 @@
 let lookback      = 7d;
 let MinRiskScore  = 7;
 
-// HIGH-CONFIDENCE LOLBins: excludes high-volume shells (powershell, cmd, etc.)
 let LolBins_HighFidelity = dynamic([
     "rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe","wscript.exe","cscript.exe",
     "certutil.exe","bitsadmin.exe","schtasks.exe","taskkill.exe","pcalua.exe","forfiles.exe"
 ]);
 
-// Indicators focused on unique strings for highest-risk activity (LSASS, AMSI, obfuscation, tamper)
 let Indicators_HighRisk = dynamic([
     "comsvcs.dll","MiniDump","lsass.dmp",
     "AmsiUtils","AmsiScanBuffer","amsiInitFailed","System.Management.Automation.AmsiUtils",
@@ -32,24 +30,19 @@ DeviceProcessEvents
 | where ProcessCommandLine has_any (Indicators_HighRisk)
 | extend
     IndicatorType = case(
-        // LSASS dump via rundll32/comsvcs or direct LSASS dump artefacts
         (FileName =~ "rundll32.exe" and ProcessCommandLine has_any ("comsvcs.dll","MiniDump"))
             or ProcessCommandLine has "lsass.dmp",
             "LSASS Dump",
 
-        // AMSI bypass
         ProcessCommandLine has_any ("AmsiUtils","AmsiScanBuffer","amsiInitFailed","System.Management.Automation.AmsiUtils"),
             "AMSI Bypass",
 
-        // Encoded / obfuscated payload
         ProcessCommandLine has_any ("-enc","-encodedcommand","FromBase64String","[Convert]::FromBase64String","IEX(","Invoke-Expression"),
             "Encoded Payload",
 
-        // Defender tamper
         ProcessCommandLine has_any ("Set-MpPreference","DisableRealtimeMonitoring","DisableIOAVProtection","MpCmdRun.exe -RemoveDefinitions"),
             "Security Service Tamper (Defender)",
 
-        // Certutil / Bitsadmin downloader usage
         FileName in~ ("certutil.exe","bitsadmin.exe") and ProcessCommandLine has_any ("-urlcache","transfer"),
             "Suspicious Download via Proxy",
 
