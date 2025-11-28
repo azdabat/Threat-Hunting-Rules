@@ -1,5 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////////////
 // Browser Extension Installation Hunt — Low CPU Native
+// Use for short window hunting (Noisy)
 // Rule Title: Browser_Extension_Install_Surface
 // Author: Ala Dabat
 // Version: 2025-11
