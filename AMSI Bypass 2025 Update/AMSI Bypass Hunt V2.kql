@@ -2,6 +2,7 @@
 // Rule: LOLBins_High_Confidence_V3
 // Author: Ala Dabat 
 // Purpose: Detect LOW-VOLUME, HIGH-CONFIDENCE LOLBins used for LSASS dumping, AMSI bypass, and execution via proxy.
+// Non-production tested
 // Tactics: Defense Evasion, Credential Access, Execution
 // Techniques: T1003.001, T1562.001, T1027, T1218
 ////////////////////////////////////////////////////////////////////////////////////////////
