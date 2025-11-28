@@ -57,7 +57,6 @@ DeviceRegistryEvents
          RegistryKeyLower = tolower(RegistryKey),
          LowerData = tolower(ValueData);
 
-// Join initiating process context (best-effort match)
 let WithProc =
 Raw
 | join kind=leftouter (
@@ -76,7 +75,7 @@ Raw
          ProcCompany= InitiatingProcessVersionInfoCompanyName,
          ProcUser   = InitiatingProcessAccountName;
 
-// Extract signals (binary flags)
+// binary flagss
 let WithIOC =
 WithProc
 | extend
@@ -98,7 +97,7 @@ WithIOC
 | extend DeviceCount = coalesce(DeviceCount, 0),
          IsRare = iif(DeviceCount <= 2, 1, 0);
 
-// SIGNAL COUNT (human-friendly)
+// SIGNAL COUNT 
 Enriched
 | extend SignalCount =
       HasBadString
@@ -108,7 +107,6 @@ Enriched
     + (1 - IsTrustedPublisher)
     + IsRare
     + (IsIFEO or IsCOM or IsLSA)
-// Aggregate per device + value
 | summarize
     FirstSeen = min(ProcTime),
     LastSeen  = max(ProcTime),
