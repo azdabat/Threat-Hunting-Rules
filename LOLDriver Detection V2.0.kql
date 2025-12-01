@@ -1,0 +1,109 @@
+// =======================================================================
+// RULE: LOLDrivers_LoadDetection_MITRE_Adaptive_V4
+// AUTHOR: Ala Dabat
+// PURPOSE: Detect loading of vulnerable/malicious/signed-abused kernel 
+//          drivers using the LOLDrivers external repo.
+// CONTEXT: Includes MITRE mapping, Driver Severity Scoring, and 
+//          dynamic HunterDirectives to guide triage actions.
+// TABLES: DeviceEvents (DriverLoad), externaldata (LOLDrivers repo)
+// MITRE: T1068 (Priv Esc), T1014 (Rootkit), T1547.006 (Boot/Driver Load) etc...
+// =======================================================================
+
+// 1. Ingest External LOLDrivers Dataset
+let VulnerableDriverData = externaldata (
+    Id:string, Author:string, Created:string, Command:string, Description:string,
+    Usecase:string, Category:string, Privileges:string, MitreID:string, OperatingSystem:string,
+    Resources:string, DriverInfo:string, ContactPerson:string, HandleReference:string,
+    DetectionMethod:string, MD5_Hashes:string, SHA1_Hashes:string, SHA256_Hashes:string,
+    PublisherInfo:string, CompanyInfo:string, VulnerabilityDetails:string,
+    MD5_Authentihash:string, SHA256_Authentihash:string, SHA1_Authentihash:string,
+    VerificationStatus:string, TagsInfo:string
+)
+["https://www.loldrivers.io/api/drivers.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+// 2. Normalize dataset → expand SHA256 hashes
+let RepoSHA256 = VulnerableDriverData
+| extend IndividualHash = split(SHA256_Hashes, ",")
+| mv-expand IndividualHash
+| extend NormalizedRepoSHA256 = trim(" ", tolower(IndividualHash))
+| where isnotempty(NormalizedRepoSHA256);
+
+// 3. Collect loaded drivers from MDE
+let LoadedDrivers = DeviceEvents
+| where ActionType =~ "DriverLoad"
+| extend LoadedSHA256 = trim(" ", tolower(SHA256)),
+         LoadedDriver = FileName;
+
+// 4. Join → Identify matches against LOLDrivers
+let Matches = LoadedDrivers
+| join kind=inner RepoSHA256
+    on $left.LoadedSHA256 == $right.NormalizedRepoSHA256
+| where not(LoadedDriver == "DBUtilDrv2.sys" and Category != "malicious")  // reduce noise
+| summarize arg_max(Timestamp, *) by DeviceName, LoadedSHA256;
+
+// 5. Severity + Hunter Directive Engine
+Matches
+| extend 
+    // Severity Classification based on driver Category & Verified field
+    Severity = case(
+        Category has_cs "malicious", "CRITICAL",
+        Category has_cs "vulnerable driver" and VerificationStatus =~ "TRUE", "HIGH",
+        Category has_cs "vulnerable driver" and VerificationStatus =~ "FALSE", "MEDIUM",
+        "LOW"
+    ),
+
+    // Attach MITRE context from repo (T1068, T1014 etc.)
+    MITRE_Context = case(
+        MitreID == "T1068", "Privilege Escalation via Vulnerable/Abused Kernel Driver (T1068)",
+        MitreID == "T1014", "Rootkit / Defense Evasion via Signed Malicious Driver (T1014)",
+        MitreID, MitreID
+    ),
+
+    // Dynamic Hunter Directives
+    HunterDirectives = case(
+
+        // CRITICAL
+        Severity == "CRITICAL",
+        "CRITICAL: Malicious kernel driver loaded. Immediate IR required. " 
+        "Acquire live memory, isolate host, check for C2/implant activity, "
+        "search for persistence (services, startup tasks), validate driver "
+        "signature anomalies. Block hash globally and initiate threat hunt.",
+
+        //  HIGH 
+        Severity == "HIGH",
+        "HIGH: Verified vulnerable driver load. Check initiating process, "
+        "identify tool responsible (EDR bypass / BYOVD attempt), review "
+        "recent privilege escalation attempts, memory read/write behaviour, "
+        "and block driver if not sanctioned in baseline.",
+
+        // MEDIUM 
+        Severity == "MEDIUM",
+        "MEDIUM: Unsigned or unverified vulnerable driver. Validate whether "
+        "this belongs to legitimate OEM software. If not known-good, escalate "
+        "to High and request user/system owner validation.",
+
+        // --- LOW ---
+        "LOW: Driver appears in LOLDrivers but signature/publisher mismatch "
+        "or rarely seen. Validate normal business use if recurring."
+    ),
+    VT_Domain = strcat("https://www.virustotal.com/gui/file/", LoadedSHA256)
+| project 
+    Timestamp,
+    DeviceName,
+    LoadedDriver,
+    LoadedSHA256,
+    Category,
+    VerificationStatus,
+    MITRE_Context,
+    Severity,
+    HunterDirectives,
+    Author,
+    Created,
+    Description,
+    Usecase,
+    PublisherInfo,
+    CompanyInfo,
+    Resources,
+    TagsInfo,
+    VT_Domain
