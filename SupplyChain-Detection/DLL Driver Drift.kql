@@ -1,0 +1,90 @@
+// ==========================================================
+// L3 Hunt — DLL Sideloading • Driver Abuse • Registry Persistence
+// Author: Ala Dabat
+// Purpose: Behavioural detection of DLL drops, driver staging,
+//          registry persistence patterns, and low-prevalence loaders.
+// ==========================================================
+
+// ---- Tunables ----
+let Window = 14d;
+let PrevalenceWindow = 90d;
+let FastLoadSec = 300;
+let LongDormancySec = 604800;
+let AlertScore = 32;
+
+// ---- Prevalence (low CPU: FileEvents only by hash) ----
+let Prevalence =
+DeviceFileEvents
+| where Timestamp >= ago(PrevalenceWindow)
+| summarize SeenDevices = dcount(DeviceId) by SHA256;
+
+// ---- DLL Loads ----
+let Loads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(Window)
+| project LoadTime = Timestamp, DeviceId, DeviceName,
+          DLL = ImageFileName, DLL_SHA256 = tostring(coalesce(SHA256, ImageHash)),
+          Loader = ProcessFileName, Signer, SignatureStatus;
+
+// ---- DLL Creates ----
+let Creates =
+DeviceFileEvents
+| where Timestamp >= ago(Window)
+| where FileName endswith ".dll"
+| project CreateTime = Timestamp, DeviceId, FileName, FolderPath,
+          SHA256, Creator = InitiatingProcessFileName;
+
+// ---- Registry (DLL-related keys only) ----
+let Reg =
+DeviceRegistryEvents
+| where Timestamp >= ago(Window)
+| where ActionType == "RegistryValueSet"
+| where RegistryValueData has ".dll"
+      or RegistryKey has @"InprocServer32"
+      or RegistryKey has @"ServiceDll"
+| project RegTime = Timestamp, DeviceId, RegistryKey, RegistryValueData;
+
+// ---- Driver Drops (.sys) ----
+let Drivers =
+DeviceFileEvents
+| where Timestamp >= ago(Window)
+| where FileName endswith ".sys"
+| project DriverTime = Timestamp, DeviceId,
+          SysName = FileName, SysPath = FolderPath,
+          SysCreator = InitiatingProcessFileName;
+
+// ---- Core correlation: DLL Load -> Create -> Drivers -> Registry ----
+let Core =
+Loads
+| join kind=leftouter Creates on DeviceId, DLL_SHA256 == SHA256
+| join kind=leftouter Prevalence on DLL_SHA256 == SHA256
+| extend Seconds_CreateToLoad =
+    iff(isnotempty(CreateTime), datetime_diff("second", LoadTime, CreateTime), real(null)),
+    RareDLL = iff(SeenDevices <= 2 or isnull(SeenDevices), 1, 0),
+    Unsigned = iff(SignatureStatus !in ("Signed","Valid") or isempty(Signer), 1, 0),
+    FastLoad = iff(Seconds_CreateToLoad between (0 .. FastLoadSec), 1, 0),
+    DormantLoad = iff(Seconds_CreateToLoad > FastLoadSec and Seconds_CreateToLoad <= LongDormancySec, 1, 0)
+| join kind=leftouter Drivers on DeviceId
+    and DriverTime between (LoadTime - 1h .. LoadTime + 1h)
+| join kind=leftouter Reg on DeviceId
+    and RegTime between (LoadTime - 1h .. LoadTime + 1h)
+| extend
+    HasDriver = iff(isnotempty(SysName), 1, 0),
+    HasDLLReg = iff(isnotempty(RegistryValueData), 1, 0);
+
+// ---- Scoring (compact, behavioural-only) ----
+Core
+| extend Score =
+      (5 * FastLoad) +
+      (4 * DormantLoad) +
+      (4 * Unsigned) +
+      (3 * RareDLL) +
+      (4 * HasDriver) +
+      (4 * HasDLLReg)
+| where Score >= AlertScore
+| project LoadTime, DeviceName, Loader, DLL, DLL_SHA256,
+          Seconds_CreateToLoad, Unsigned, RareDLL,
+          HasDriver, SysName, SysPath,
+          HasDLLReg, RegistryKey, RegistryValueData,
+          Score
+| order by Score desc, LoadTime desc
