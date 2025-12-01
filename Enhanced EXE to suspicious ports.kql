@@ -1,0 +1,116 @@
+// ============================================================================
+// Rule: Outbound Executables to Public IPs — Scored Hunt
+// Author: Ala Dabat
+// Purpose: Identify suspicious outbound network activity from .exe processes
+//          to public IPs, applying rarity scoring, country-risk scoring,
+//          suspicious path detection, and device-type weighting.
+// Data Sources: DeviceNetworkEvents, DeviceInfo
+// MITRE: TA0011 Command & Control, TA0008 Lateral Movement, TA0003 Persistence
+// Kill Chain Mapping: Delivery → C2 → Action on Objectives
+// ============================================================================
+
+let lookback = 7d;
+
+// Country risk model (tune per org)
+let HighRiskCountries = dynamic(["RU","CN","IR","KP","BY"]);
+let MediumRiskCountries = dynamic(["BR","TR","IN","UA","RO","BG"]);
+
+// Latest device context
+let DeviceCtx =
+    DeviceInfo
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project DeviceId, DeviceName, OSPlatform, DeviceType, ExposureLevel, PublicIP;
+
+// Raw outbound flows
+let Flows =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | where RemoteIPType == "Public"
+    | extend ProcName = tostring(InitiatingProcessFileName)
+    | where ProcName endswith ".exe"
+    | project Timestamp, DeviceId, ProcName,
+              ProcCommand = InitiatingProcessCommandLine,
+              ProcUser    = InitiatingProcessAccountUpn,
+              RemoteIP, RemoteCountry, RemotePort, RemoteUrl;
+
+// Prevalence model — exe seen across estate
+let ProcessPrevalence =
+    Flows
+    | summarize SeenDevices = dcount(DeviceId) by ProcName;
+
+// Join device context + prevalence
+Flows
+| join kind=leftouter DeviceCtx on DeviceId
+| join kind=leftouter ProcessPrevalence on ProcName
+| extend SeenDevices = coalesce(SeenDevices, 0)
+
+// Suspicious path heuristic
+| extend SuspiciousPath = iif(
+        tolower(ProcCommand) has "\\users\\" and 
+        tolower(ProcCommand) has_any ("appdata","downloads","temp","roaming"),
+        1, 0)
+
+// Country risk score
+| extend CountryScore =
+        iif(RemoteCountry in (HighRiskCountries), 40,
+        iif(RemoteCountry in (MediumRiskCountries), 20, 5))
+
+// Rarity score
+| extend RarityScore =
+        iif(SeenDevices == 0, 40,
+        iif(SeenDevices <= 2, 20,
+        iif(SeenDevices <= 5, 10, 0)))
+
+// Server weighting
+| extend ServerBoost = iif(DeviceType =~ "Server", 15, 0)
+
+// Composite score
+| extend RiskScore =
+        CountryScore +
+        RarityScore +
+        (SuspiciousPath * 20) +
+        ServerBoost
+
+| extend Severity = case(
+        RiskScore >= 70, "HIGH",
+        RiskScore >= 45, "MEDIUM",
+        "LOW"
+    )
+
+| summarize
+      FirstSeen      = min(Timestamp),
+      LastSeen       = max(Timestamp),
+      EventCount     = count(),
+      DeviceName     = any(DeviceName),
+      OSPlatform     = any(OSPlatform),
+      DeviceType     = any(DeviceType),
+      ExposureLevel  = any(ExposureLevel),
+      PublicIP       = any(PublicIP),
+      SampleCommand  = any(ProcCommand),
+      ProcUser       = any(ProcUser),
+      Country        = any(RemoteCountry),
+      Url            = any(RemoteUrl),
+      RemotePort     = any(RemotePort),
+      MaxScore       = max(RiskScore),
+      Severity       = any(Severity),
+      SuspiciousPath = max(SuspiciousPath)
+  by ProcName, RemoteIP
+
+| extend MITRE_Techniques = "T1071.001 Web C2; T1105 Exfiltration/Upload; T1021 Remote Services",
+         KillChainStage = case(
+            Severity == "HIGH",   "C2 / Exfiltration",
+            Severity == "MEDIUM", "Delivery / Beaconing",
+            "Initial Contact"
+         )
+
+| extend ThreatHunterDirectives = pack_array(
+    strcat("Investigate outbound process: ", ProcName, " → ", RemoteIP),
+    strcat("Process path suspicious: ", tostring(SuspiciousPath)),
+    strcat("Country=", Country, ", Score=", tostring(MaxScore)),
+    strcat("User=", ProcUser, ", Cmd=", SampleCommand),
+    "Pivot across estate for same process or destination IP.",
+    "Review parent/child process lineage for initial execution vector.",
+    "Validate whether this executable is expected to make outbound calls."
+)
+
+| order by MaxScore desc
