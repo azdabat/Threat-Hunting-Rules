@@ -1,162 +1,86 @@
-// The rule works by enriching raw sign-in data with risk scoring and contextual analysis to quickly identify malicious use of the ROPC flow,
-// a common method attackers use to bypass Multi-Factor Authentication (MFA).
-// Author: Ala Dabat
+// ROPC / Legacy Protocol Abuse Detection
+// Author: Ala Dabat | Platform: Microsoft Sentinel
+// Purpose: Detect credential theft and MFA bypass attempts using ROPC-based legacy flows
+
+let lookback = 7d;
 
 SigninLogs
+| where TimeGenerated >= ago(lookback)
 | where AuthenticationProtocol contains "ROPC" or UserAgent has "BAV2ROPC"
-| extend 
-    RiskScore = 0,
-    ThreatIndicators = pack_array(),
-    AttackPattern = "",
-    // Enhanced status mapping from your detailed query
+| extend
     LoginStatus = case(
         ResultType == 0, "Successful",
-        ResultType == 50126, "Invalid credentials",
-        ResultType == 50055, "Password expired", 
-        ResultType == 50074, "Strong authentication required",
-        ResultType == 50155, "Device authentication failed",
-        ResultType == 700016, "Application not found",
+        ResultType == 50126, "InvalidCredentials",
+        ResultType == 50055, "PasswordExpired",
+        ResultType == 50074, "StrongAuthRequired",
+        ResultType == 50155, "DeviceAuthFailed",
+        ResultType == 700016, "AppNotFound",
         "Other"
     ),
-    IsSuccessful = iff(ResultType == 0, 1, 0),
-    IsCredentialFailure = iff(ResultType == 50126, 1, 0)
-| extend 
-    // Risk scoring based on multiple factors
-    RiskScore = case(
-        UserAgent has "BAV2ROPC" and IsSuccessful == 1, 85,  // High risk for successful BAV2ROPC
-        UserAgent has "BAV2ROPC", 70,  // Medium risk for attempted BAV2ROPC
-        AuthenticationProtocol contains "ROPC" and IsSuccessful == 1, 60,  // Medium risk for successful ROPC
-        AuthenticationProtocol contains "ROPC", 40,  // Low risk for attempted ROPC
+    IsSuccess = iif(ResultType == 0, 1, 0),
+    IsCredFail = iif(ResultType == 50126, 1, 0),
+    BaseRisk = case(
+        UserAgent has "BAV2ROPC" and IsSuccess == 1, 80,
+        UserAgent has "BAV2ROPC", 60,
+        AuthenticationProtocol contains "ROPC" and IsSuccess == 1, 50,
+        AuthenticationProtocol contains "ROPC", 30,
         0
     ),
-    // Threat intelligence enrichment
-    ThreatIndicators = case(
-        UserAgent has "BAV2ROPC", array_concat(ThreatIndicators, ["Legacy Bypass Attempt"]),
-        IsSuccessful == 1 and AuthenticationProtocol contains "ROPC", array_concat(ThreatIndicators, ["Successful ROPC Auth"]),
-        IsCredentialFailure == 1, array_concat(ThreatIndicators, ["Credential Failure"]),
-        ThreatIndicators
-    ),
-    AttackPattern = case(
-        UserAgent has "BAV2ROPC" and IsSuccessful == 1, "BAV2ROPC Legacy Bypass Successful",
-        UserAgent has "BAV2ROPC", "BAV2ROPC Legacy Bypass Attempt", 
-        AuthenticationProtocol contains "ROPC" and IsSuccessful == 1, "ROPC Flow Successful",
-        AuthenticationProtocol contains "ROPC", "ROPC Flow Attempt",
-        "Unknown"
-    )
-| summarize 
-    TotalAttempts = count(),
-    SuccessfulLogins = sum(IsSuccessful),
-    FailedAttempts = sum(IsCredentialFailure),
-    UniqueUsers = dcount(UserPrincipalName),
-    UserAgents = make_set(UserAgent),
-    UserPrincipalNames = make_set(UserPrincipalName),
-    Locations = make_set(LocationDetails),
-    RiskScore = max(RiskScore),
-    ThreatIndicators = make_set(ThreatIndicators),
-    AttackPatterns = make_set(AttackPattern),
-    FirstAttempt = min(TimeGenerated),
-    LastAttempt = max(TimeGenerated),
-    // Session duration analysis for successful logins
-    AvgSessionDuration = avg(iff(IsSuccessful == 1, todouble(ResultDescription), 0)),
-    // Failed attempt patterns
-    FailedUserPattern = make_set(iff(IsCredentialFailure == 1, UserPrincipalName, "")),
-    // IP reputation scoring
-    IPFrequency = count() by bin(TimeGenerated, 1h)
-    by IPAddress, AppId, AppDisplayName
-| extend 
-    // Enhanced risk assessment
+    Pattern =
+        case(
+            UserAgent has "BAV2ROPC" and IsSuccess == 1, "BAV2ROPC_Success",
+            UserAgent has "BAV2ROPC", "BAV2ROPC_Attempt",
+            AuthenticationProtocol contains "ROPC" and IsSuccess == 1, "ROPC_Success",
+            AuthenticationProtocol contains "ROPC", "ROPC_Attempt",
+            "Unknown"
+        )
+| summarize
+    FirstSeen=min(TimeGenerated),
+    LastSeen=max(TimeGenerated),
+    Attempts=count(),
+    Successes=sum(IsSuccess),
+    Failures=sum(IsCredFail),
+    Users=make_set(UserPrincipalName,10),
+    UniqueUsers=dcount(UserPrincipalName),
+    UserAgents=make_set(UserAgent,10),
+    Locations=make_set(LocationDetails,10),
+    Patterns=make_set(Pattern,10),
+    BaseRisk=max(BaseRisk)
+  by IPAddress, AppDisplayName
+| extend
+    SprayUser = iif(UniqueUsers >= 5 and Failures >= 3, 1, 0),
+    SprayPassword = iif(Failures >= 10 and UniqueUsers >= 3, 1, 0),
+    Rapid = iif(Attempts >= 20 and datetime_diff("minute", LastSeen, FirstSeen) < 30, 1, 0),
+    FinalRisk = BaseRisk
+        + (SprayUser * 15)
+        + (SprayPassword * 20)
+        + (Rapid * 10),
     RiskLevel = case(
-        RiskScore >= 80, "CRITICAL",
-        RiskScore >= 60, "HIGH", 
-        RiskScore >= 40, "MEDIUM",
-        RiskScore >= 20, "LOW",
+        FinalRisk >= 90, "CRITICAL",
+        FinalRisk >= 70, "HIGH",
+        FinalRisk >= 50, "MEDIUM",
+        FinalRisk >= 30, "LOW",
         "INFO"
     ),
-    // Attack confidence scoring
-    AttackConfidence = case(
-        RiskLevel == "CRITICAL" and SuccessfulLogins >= 3, 95,
-        RiskLevel == "HIGH" and SuccessfulLogins >= 2, 85,
-        RiskLevel == "MEDIUM" and SuccessfulLogins >= 1, 70,
-        RiskLevel == "LOW" and FailedAttempts >= 5, 60,
-        30
+    KillChain = case(
+        FinalRisk >= 90 and Successes > 0, "Credential Access → Account Compromise",
+        FinalRisk >= 70 and Successes > 0, "Credential Access",
+        SprayPassword == 1, "Password Spray Attempt",
+        Rapid == 1, "Rapid Repeated Auth Attempts",
+        "Initial Probe"
     ),
-    // Behavioral analysis
-    UserSprayIndicator = iff(UniqueUsers >= 5 and FailedAttempts >= 3, 1, 0),
-    PasswordSprayIndicator = iff(FailedAttempts >= 10 and UniqueUsers >= 3, 1, 0),
-    RapidFireIndicator = iff(TotalAttempts >= 20 and datetime_diff('minute', LastAttempt, FirstAttempt) < 30, 1, 0)
-| extend 
-    FinalRiskScore = RiskScore + 
-        (UserSprayIndicator * 15) + 
-        (PasswordSprayIndicator * 20) + 
-        (RapidFireIndicator * 10),
-    FinalRiskLevel = case(
-        FinalRiskScore >= 90, "CRITICAL",
-        FinalRiskScore >= 70, "HIGH",
-        FinalRiskScore >= 50, "MEDIUM", 
-        FinalRiskScore >= 30, "LOW",
-        "INFO"
+    HunterNotes = pack_array(
+        strcat("RiskLevel=", RiskLevel, ", Attempts=", Attempts, ", Successes=", Successes),
+        strcat("Users: ", tostring(Users)),
+        strcat("UserAgents: ", tostring(UserAgents)),
+        strcat("Patterns: ", tostring(Patterns)),
+        strcat("SprayUser=", tostring(SprayUser), ", SprayPassword=", tostring(SprayPassword), ", Rapid=", tostring(Rapid)),
+        "If High/Critical: investigate sign-in trails, confirm user legitimacy, reset credentials, apply CA hardening."
     )
-| extend 
-    // THREAT HUNTER DIRECTIVES - Actionable investigation guidance
-    ThreatHunterDirectives = case(
-        FinalRiskLevel == "CRITICAL", "IMMEDIATE INVESTIGATION REQUIRED: Check for compromised accounts, review user activity logs, force password reset, check for MFA bypass attempts",
-        FinalRiskLevel == "HIGH", "URGENT REVIEW: Investigate IP reputation, review user consent grants, check for unusual application access patterns",
-        FinalRiskLevel == "MEDIUM", "PRIORITY REVIEW: Monitor for additional attempts, validate user agent legitimacy, check conditional access policies",
-        FinalRiskLevel == "LOW", "STANDARD MONITORING: Review for patterns over time, educate users about legacy auth risks",
-        "BASELINE MONITORING"
-    ),
-    InvestigationSteps = case(
-        FinalRiskLevel == "CRITICAL", pack_array(
-            "1. IMMEDIATE: Check AuditLogs for suspicious activities from these users",
-            "2. REVIEW: All successful sign-ins from this IP in last 24 hours", 
-            "3. VALIDATE: User agent legitimacy and expected behavior",
-            "4. CONTAIN: Consider blocking IP and forcing MFA re-registration",
-            "5. ESCALATE: To security team for compromised account investigation"
-        ),
-        FinalRiskLevel == "HIGH", pack_array(
-            "1. REVIEW: User sign-in patterns and geographic consistency",
-            "2. CHECK: Application permissions and consent grants",
-            "3. VERIFY: User awareness of these authentication attempts", 
-            "4. MONITOR: For repeated patterns from same IP/user combinations",
-            "5. UPDATE: Conditional Access policies to block legacy auth"
-        ),
-        FinalRiskLevel == "MEDIUM", pack_array(
-            "1. ANALYZE: Authentication protocol usage trends",
-            "2. IDENTIFY: Business justification for ROPC usage",
-            "3. DOCUMENT: Risk acceptance if legitimate business need",
-            "4. PLAN: Migration away from legacy authentication"
-        ),
-        pack_array("Standard monitoring and trend analysis")
-    ),
-    MitigationRecommendations = case(
-        FinalRiskLevel == "CRITICAL", "BLOCK IP, FORCE PASSWORD RESET, REQUIRE MFA RE-REGISTRATION, REVIEW USER MAILBOX RULES",
-        FinalRiskLevel == "HIGH", "BLOCK LEGACY AUTH VIA CONDITIONAL ACCESS, REVIEW APP CONSENTS, EDUCATE USERS",
-        FinalRiskLevel == "MEDIUM", "PHASE OUT ROPC DEPENDENCIES, IMPLEMENT RISK-BASED POLICIES, MONITOR FOR ESCALATION",
-        FinalRiskLevel == "LOW", "EDUCATE USERS, PLAN MODERN AUTH MIGRATION, CONTINUOUS MONITORING"
-    )
-| project 
-    TimeGenerated = FirstAttempt,
-    IPAddress,
-    AppDisplayName,
-    FinalRiskLevel,
-    FinalRiskScore,
-    AttackConfidence,
-    TotalAttempts,
-    SuccessfulLogins,
-    FailedAttempts,
-    UniqueUsers,
-    UserSprayIndicator,
-    PasswordSprayIndicator,
-    RapidFireIndicator,
-    UserAgents,
-    UserPrincipalNames,
-    Locations,
-    AttackPatterns,
-    ThreatIndicators,
-    ThreatHunterDirectives,
-    InvestigationSteps,
-    MitigationRecommendations,
-    FirstAttempt,
-    LastAttempt,
-    DurationMinutes = datetime_diff('minute', LastAttempt, FirstAttempt)
-| order by FinalRiskScore desc, SuccessfulLogins desc
+| where FinalRisk >= 50
+| project
+    FirstSeen, LastSeen, IPAddress, AppDisplayName,
+    Attempts, Successes, Failures, UniqueUsers,
+    Locations, UserUsers=Users, UserAgents, Patterns,
+    FinalRisk, RiskLevel, KillChain, HunterNotes
+| order by FinalRisk desc, Attempts desc
