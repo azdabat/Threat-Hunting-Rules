@@ -1,0 +1,81 @@
+// LOLDrivers – Malicious & Vulnerable Driver Load Detection
+// Author: Ala Dabat
+
+// --- Load LOLDrivers external repo ---
+let DriverRepo = externaldata (
+    Id:string, Author:string, Created:string, Category:string, MitreID:string,
+    SHA256_Hashes:string, VerificationStatus:string, TagsInfo:string
+)
+["https://www.loldrivers.io/api/drivers.csv"]
+with (format="csv", ignoreFirstRecord=true);
+
+//  Normalize Repo Hashes
+let RepoSHA =
+    DriverRepo
+    | extend H = split(SHA256_Hashes, ",")
+    | mv-expand H
+    | extend RepoSHA256 = trim(" ", tolower(H))
+    | where RepoSHA256 != "";
+
+//  Org Prevalence Baseline (30 days)
+let Prevalence =
+    DeviceEvents
+    | where ActionType == "DriverLoad"
+    | extend H = trim(" ", tolower(SHA256))
+    | where H != ""
+    | summarize OrgSeenCount = dcount(DeviceName) by H;
+
+// Driver Loads
+let Loads =
+    DeviceEvents
+    | where ActionType == "DriverLoad"
+    | extend LoadSHA256 = trim(" ", tolower(SHA256)),
+             DriverName = FileName;
+
+// --- Match against LOLDrivers ---
+Loads
+| join kind=inner RepoSHA on $left.LoadSHA256 == $right.RepoSHA256
+| lookup Prevalence on LoadSHA256 == H
+| extend OrgSeenCount = coalesce(OrgSeenCount, 0)
+
+// --- Scoring Engine (0–100) ---
+| extend Score = 0
+    + case(Category =~ "malicious", 70,
+           Category =~ "vulnerable driver" and VerificationStatus =~ "TRUE", 50,
+           Category =~ "vulnerable driver", 35,
+           10)
+    + case(OrgSeenCount == 0, 20, OrgSeenCount < 3, 10, 0)
+| extend Severity = case(
+    Score >= 80, "CRITICAL",
+    Score >= 60, "HIGH",
+    Score >= 40, "MEDIUM",
+    "LOW"
+)
+| extend MITRE = case(
+    MitreID == "T1068", "T1068 | Kernel driver exploitation",
+    MitreID == "T1014", "T1014 | Rootkit via signed driver",
+    MitreID
+)
+| extend HunterDirectives = case(
+    Severity == "CRITICAL",
+        "Isolate host, capture memory, review kernel objects, driver callbacks, and persistence. Block hash enterprise-wide.",
+    Severity == "HIGH",
+        "Check initiating process, identify tool responsible, validate software legitimacy, inspect priv-esc and EDR bypass attempts.",
+    Severity == "MEDIUM",
+        "Ask system owner to validate usage. If unexpected or rarely seen, escalate and restrict driver load.",
+    "Review recurrence and baseline. Mark as approved only with evidence."
+)
+| project
+    Timestamp,
+    DeviceName,
+    DriverName,
+    LoadSHA256,
+    Category,
+    VerificationStatus,
+    Severity,
+    Score,
+    OrgSeenCount,
+    MITRE,
+    HunterDirectives,
+    VT = strcat("https://www.virustotal.com/gui/file/", LoadSHA256),
+    TagsInfo
