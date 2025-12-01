@@ -1,12 +1,9 @@
-// OAuth Consent Abuse Detection
-// Author: Ala Dabat
-// Platform: Microsoft Sentinel
-// Purpose: Highlight risky OAuth consents and active token usage
+// OAuth Consent Abuse Detection — High-Risk Grants & Usage
+// Author: Ala Dabat | Platform: Microsoft Sentinel
+// MITRE: TA0001 (Initial Access), TA0003 (Persistence), T1550.001 (OAuth Token Abuse)
 
-let Lookback = 30d;
-let CriticalThreshold = 9;
-let HighThreshold     = 6;
-let MediumThreshold   = 3;
+let Lookback      = 30d;
+let RiskThreshold = 10;
 
 let KnownSafeApps = dynamic([
     "Microsoft Teams","SharePoint Online","Outlook Web App","OneDrive","Office 365 Portal",
@@ -52,11 +49,11 @@ let HighRiskRegex = dynamic([
   @"^(Channel(Message)?|Chat)\.(Read.*|ReadWrite.*)$",
   @".*\.FullControl\.All$",
   @".*\.ReadWrite\.All$"
-);
+];
 
-// ----------------------
-// Consent extraction
-// ----------------------
+// --------------------------------------------------------
+// Consent events (AuditLogs)
+// --------------------------------------------------------
 let Consents =
 AuditLogs
 | where TimeGenerated >= ago(Lookback)
@@ -68,13 +65,12 @@ AuditLogs
   )
 | where Result =~ "success"
 | extend Target = iff(array_length(TargetResources) > 0, TargetResources[0], dynamic(null))
-| extend
-    AppId          = tostring(Target.id),
-    AppDisplayName = tostring(Target.displayName),
-    ModifiedProps  = tostring(Target.modifiedProperties),
-    InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
-    IPAddress      = tostring(InitiatedBy.user.ipAddress),
-    UserAgent      = tostring(InitiatedBy.user.userAgent)
+| extend AppId          = tostring(Target.id),
+         AppDisplayName = tostring(Target.displayName),
+         ModifiedProps  = tostring(Target.modifiedProperties),
+         InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
+         IPAddress      = tostring(InitiatedBy.user.ipAddress),
+         UserAgent      = tostring(InitiatedBy.user.userAgent)
 | extend Props = parse_json(ModifiedProps)
 | mv-expand P = Props
 | extend PropName  = tostring(P.displayName),
@@ -91,24 +87,21 @@ AuditLogs
     IPAddress         = any(IPAddress),
     UserAgent         = any(UserAgent)
   by AppId, AppDisplayName
-| extend
-    IsAppOnly     = tobool(coalesce(parse_json(IsAppOnlyRaw), false)),
-    OnBehalfAll   = tobool(coalesce(parse_json(OnBehalfOfAllRaw), false)),
-    PublisherName = trim(@"""", tostring(PublisherNameRaw)),
-    ResourceName  = trim(@"""", tostring(ResourceNameRaw)),
-    DelegatedList = split(replace_string(tostring(DelegatedRaw), "\"",""), " "),
-    AppRolesJson  = parse_json(AppRolesRaw)
+| extend IsAppOnly     = tobool(coalesce(parse_json(IsAppOnlyRaw), false)),
+         OnBehalfAll   = tobool(coalesce(parse_json(OnBehalfOfAllRaw), false)),
+         PublisherName = trim(@"""", tostring(PublisherNameRaw)),
+         ResourceName  = trim(@"""", tostring(ResourceNameRaw)),
+         DelegatedList = split(replace_string(tostring(DelegatedRaw), "\"",""), " "),
+         AppRolesJson  = parse_json(AppRolesRaw)
 | mv-expand RoleElt = iif(isnull(AppRolesJson) or array_length(AppRolesJson)==0, dynamic(null), AppRolesJson) to typeof(string)
-| extend
-    AppRole = trim(" ", trim("\"", tostring(RoleElt))),
-    AllPerms = array_concat(DelegatedList, pack_array(AppRole))
+| extend AppRole  = trim(" ", trim("\"", tostring(RoleElt))),
+         AllPerms = array_concat(DelegatedList, pack_array(AppRole))
 | mv-expand Permission in AllPerms
 | extend Permission = trim(" ", trim("\"", tostring(Permission)))
 | where isnotempty(Permission)
-| extend
-    IsHighExact = iif(Permission in (HighRiskExact), 1, 0),
-    IsHighRegex = iif(array_length(array_filter(HighRiskRegex, (re:string) { Permission matches regex re })) > 0, 1, 0),
-    IsHighRiskPermission = iif(IsHighExact == 1 or IsHighRegex == 1 or tolower(Permission) == "offline_access", 1, 0)
+| extend IsHighExact = iif(Permission in (HighRiskExact), 1, 0),
+         IsHighRegex = iif(array_length(array_filter(HighRiskRegex, (re:string) => Permission matches regex re)) > 0, 1, 0),
+         IsHighRiskPermission = iif(IsHighExact == 1 or IsHighRegex == 1 or tolower(Permission) == "offline_access", 1, 0)
 | summarize
     HighRiskPermissionCount = sum(IsHighRiskPermission),
     HighRiskPerms           = make_set_if(Permission, IsHighRiskPermission == 1, 200),
@@ -122,103 +115,103 @@ AuditLogs
     IPAddress               = any(IPAddress),
     UserAgent               = any(UserAgent)
   by AppId, AppDisplayName
-| extend
-    IsKnownSafeApp = iif(AppDisplayName in~ (KnownSafeApps), "Yes", "No"),
-    IsKnownSafePub = iif(PublisherName in~ (KnownSafePublishers), "Yes", "No"),
-    SuspiciousUA   = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), "Yes", "No"),
-    ConsentType    = iif(OnBehalfAll, "Admin (tenant-wide)", "User"),
-    GrantKind      = iif(IsAppOnly, "Application (client credentials)", "Delegated (user)");
+| extend IsKnownSafeApp = iif(AppDisplayName in~ (KnownSafeApps), "Yes", "No"),
+         IsKnownSafePub = iif(PublisherName in~ (KnownSafePublishers), "Yes", "No"),
+         SuspiciousUA   = iif(tolower(UserAgent) has_any (SuspiciousUserAgents), "Yes", "No"),
+         ConsentType    = iif(OnBehalfAll, "Admin (tenant-wide)", "User"),
+         GrantKind      = iif(IsAppOnly, "Application (client credentials)", "Delegated (user)");
 
-// ----------------------
-// Token issuance usage
-// ----------------------
+// --------------------------------------------------------
+// Token usage (TokenIssuanceLogs)
+// --------------------------------------------------------
 let TokenUsage =
 TokenIssuanceLogs
 | where TimeGenerated >= ago(60m)
-| project
-    AppId           = tostring(AppId),
-    TokenIssuedAt   = TimeGenerated,
-    TokenGrantType  = tostring(GrantType),
-    Account         = tostring(UserPrincipalName),
-    TokenIPAddress  = IPAddress
-| summarize
-    FirstToken   = min(TokenIssuedAt),
-    LastToken    = max(TokenIssuedAt),
-    TokenUseCount = count()
+| project AppId        = tostring(AppId),
+          TokenIssuedAt = TimeGenerated,
+          TokenGrantType = tostring(GrantType),
+          Account        = tostring(UserPrincipalName),
+          TokenIPAddress = IPAddress
+| summarize FirstToken   = min(TokenIssuedAt),
+            LastToken    = max(TokenIssuedAt),
+            TokenUseCount = count()
   by AppId, Account;
 
-// ----------------------
-// Graph sign-ins (user context)
-// ----------------------
+// --------------------------------------------------------
+// Graph sign-ins (resource = Microsoft Graph)
+// --------------------------------------------------------
 let GraphSignins =
 SigninLogs
 | where TimeGenerated >= ago(Lookback)
-| where ResourceServicePrincipalId == "00000003-0000-0000-c000-000000000000"   // Microsoft Graph
-| project
-    AppId        = tostring(AppId),
-    GraphSigninAt = TimeGenerated,
-    UA           = tostring(UserAgent),
-    SigninIP     = IPAddress,
-    Account      = tostring(UserPrincipalName)
-| summarize
-    FirstGraph  = min(GraphSigninAt),
-    LastGraph   = max(GraphSigninAt),
-    GraphSignins = count()
+| where ResourceServicePrincipalId == "00000003-0000-0000-c000-000000000000"
+| project AppId  = tostring(AppId),
+          GraphSigninAt = TimeGenerated,
+          UA            = tostring(UserAgent),
+          SigninIP      = IPAddress,
+          Account       = tostring(UserPrincipalName)
+| summarize FirstGraph  = min(GraphSigninAt),
+            LastGraph   = max(GraphSigninAt),
+            GraphSignins = count()
   by AppId, Account;
 
-// ----------------------
-// Service principal (app-only) activity
-// ----------------------
+// --------------------------------------------------------
+// Service principal sign-ins
+// --------------------------------------------------------
 let SPActivity =
 ServicePrincipalSignInLogs
 | where TimeGenerated >= ago(Lookback)
-| project
-    AppId   = tostring(AppId),
-    SPName  = tostring(ServicePrincipalName),
-    SPIP    = IPAddress,
-    SPTime  = TimeGenerated
-| summarize
-    FirstSP   = min(SPTime),
-    LastSP    = max(SPTime),
-    SPCalls   = count(),
-    SampleIPs = make_set(SPIP, 3)
+| project AppId   = tostring(AppId),
+          SPName  = tostring(ServicePrincipalName),
+          SPIP    = IPAddress,
+          SPTime  = TimeGenerated
+| summarize FirstSP  = min(SPTime),
+            LastSP   = max(SPTime),
+            SPCalls  = count(),
+            SampleIPs = make_set(SPIP, 3)
   by AppId, SPName;
 
-// ----------------------
-// Correlate consent with usage and score
-// ----------------------
+// --------------------------------------------------------
+// Correlate consent + usage + sign-in activity
+// --------------------------------------------------------
 Consents
-| join kind=leftouter TokenUsage on AppId
+| join kind=leftouter TokenUsage   on AppId
 | join kind=leftouter GraphSignins on AppId
-| join kind=leftouter SPActivity on AppId
-| extend
-    RiskScore =
-          1 * HighRiskPermissionCount
-        + 2 * iif(ConsentType == "Admin (tenant-wide)", 1, 0)
-        + 2 * iif(GrantKind == "Application (client credentials)", 1, 0)
-        + 1 * iif(SuspiciousUA == "Yes", 1, 0)
-        + 1 * iif(IsKnownSafeApp == "No", 1, 0)
-        + 1 * iif(IsKnownSafePub == "No", 1, 0)
-        + 2 * iif(TokenUseCount > 0 or SPCalls > 0, 1, 0)
-| extend
-    RiskLevel = case(
-        RiskScore >= CriticalThreshold, "Critical",
-        RiskScore >= HighThreshold,     "High",
-        RiskScore >= MediumThreshold,   "Medium",
-        "Low"
-    ),
-    KillChainStage = case(
-        TokenUseCount == 0 and SPCalls == 0, "Consent granted (no observed token usage)",
-        TokenUseCount > 0 and not(IsAppOnly), "Delegated token usage observed",
-        SPCalls > 0 and IsAppOnly, "App-only token usage observed",
-        TokenUseCount > 0 and SPCalls > 0, "Mixed user + app token usage",
-        "Unknown"
-    ),
-    MITRE_Tactic    = "TA0001: Initial Access; TA0003: Persistence",
-    MITRE_Technique = "T1550.001: OAuth Token Abuse"
+| join kind=leftouter SPActivity   on AppId
+| extend RiskScore =
+      1 * HighRiskPermissionCount
+    + 2 * iif(ConsentType == "Admin (tenant-wide)", 1, 0)
+    + 2 * iif(GrantKind == "Application (client credentials)", 1, 0)
+    + 1 * iif(SuspiciousUA == "Yes", 1, 0)
+    + 1 * iif(IsKnownSafeApp == "No", 1, 0)
+    + 1 * iif(IsKnownSafePub == "No", 1, 0)
+    + 2 * iif(TokenUseCount > 0 or SPCalls > 0, 1, 0)
+| extend RiskLevel = case(
+    RiskScore >= 15, "Critical",
+    RiskScore >= 10, "High",
+    RiskScore >= 7,  "Medium",
+    "Low"
+  ),
+  KillChainStage = case(
+    HighRiskPermissionCount > 0 and ConsentType == "Admin (tenant-wide)", "Initial Access / Tenant-Wide Persistence",
+    HighRiskPermissionCount > 0 and TokenUseCount > 0,                 "Execution / Data Access via OAuth",
+    TokenUseCount > 0 or SPCalls > 0,                                   "Execution / Service Principal Activity",
+    "Initial Access (Consent Granted)"
+  ),
+  MITRE_Tactic    = "TA0001: Initial Access; TA0003: Persistence",
+  MITRE_Technique = "T1550.001: OAuth Token Abuse"
+| extend HuntingDirectives = pack_array(
+    strcat("Validate if consent was legitimate: ", Initiator, " from ", IPAddress),
+    strcat("Review app '", AppDisplayName, "' (AppId=", AppId, ") and publisher '", PublisherName, "'"),
+    strcat("High-risk permissions (", tostring(HighRiskPermissionCount), "): ", strcat_array(HighRiskPerms, ", ")),
+    strcat("Check token usage (TokenUseCount=", tostring(TokenUseCount), ", SPCalls=", tostring(SPCalls), ")"),
+    "Pivot on IP/UserAgent in SigninLogs for unusual patterns",
+    "If unapproved, revoke consent, revoke refresh tokens, and reset affected accounts",
+    "Harden Conditional Access and app consent policies if necessary"
+)
+| where RiskScore >= RiskThreshold
 | project
     AppId, AppDisplayName, CreatedTime,
-    ConsentType, GrantKind,
+    ConsentType, GrantKind, KillChainStage, RiskScore, RiskLevel,
     Initiator, IPAddress, UserAgent,
     PublisherName, ResourceName,
     HighRiskPermissionCount, HighRiskPerms, Permissions,
@@ -226,8 +219,5 @@ Consents
     FirstToken, LastToken, TokenUseCount,
     FirstGraph, LastGraph, GraphSignins,
     FirstSP, LastSP, SPCalls, SampleIPs,
-    RiskScore, RiskLevel, KillChainStage,
-    MITRE_Tactic, MITRE_Technique
-// For an alert rule, usually gate on High/Critical:
-| where RiskLevel in ("Critical","High")
+    HuntingDirectives, MITRE_Tactic, MITRE_Technique
 | order by RiskScore desc, CreatedTime desc
