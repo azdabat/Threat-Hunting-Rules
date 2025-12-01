@@ -1,118 +1,55 @@
-////////////////////////////////////////////////////////////////////////////////////////////
-// Rule: Suspicious_Ports_Jitter_Beaconing
+//////////////////////////////////////////////////////////////////////////////////////////
+// Rule: PortAgnostic_Jitter_Beaconing
 // Author: Ala Dabat
-// Version: 2025-11 (Not peoduction tested/ready)
-// Purpose: Detect suspicious outbound connections on ports from an external feed,
-//          enriched with process attribution and hybrid jitter/beacon analysis.
-// Feed: https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv
-// Tactics: TA0011 Command and Control
-// Techniques: T1071;T1090;T1573
-////////////////////////////////////////////////////////////////////////////////////////////
+// Purpose: Detect repeating outbound connections showing fixed or jittered beacon patterns,
+//          independent of port or protocol.
+// Environment: Microsoft Defender for Endpoint (DeviceNetworkEvents)
+// Notes: Tune MinConnections and MinIntervalSeconds for your estate.
+//////////////////////////////////////////////////////////////////////////////////////////
 
-let lookback = 7d;
+let Lookback = 7d;
+let MinConnections = 6;
+let MinIntervalSeconds = 10;
+let MaxIntervalSeconds = 7200;
 
-// 1. Load external suspicious ports feed (no CTI tables)
-let SuspiciousPortsData =
-externaldata(
-    dest_port:int,
-    metadata_comment:string,
-    metadata_confidence:string,
-    metadata_detection_type:string,
-    metadata_link:string,
-    metadata_reference:string
-)
-[@"https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/suspicious_ports_list.csv"]
-with (format="csv", ignoreFirstRecord=true)
-| where metadata_confidence != "low";
-
-let SuspiciousPortList = toscalar(SuspiciousPortsData | summarize make_set(dest_port));
-let PortDetails = SuspiciousPortsData | project dest_port, metadata_comment, metadata_confidence;
-
-// 2. Raw network surface (suspicious ports only, external IPs)
 let Raw =
 DeviceNetworkEvents
-| where Timestamp >= ago(lookback)
-| where RemotePort in (SuspiciousPortList)
-| where RemoteIP !in~ ("::1","::ffff:127.0.0.1")
-| where not(RemoteIP startswith "10." or RemoteIP startswith "192.168." or RemoteIP startswith "172." or RemoteIP startswith "127.")
-| project Timestamp,DeviceName,DeviceId,RemoteIP,RemotePort,InitiatingProcessFileName,InitiatingProcessCommandLine;
+| where Timestamp >= ago(Lookback)
+| where RemoteIP !in ("127.0.0.1","::1")
+| where not(RemoteIP startswith "10." or RemoteIP startswith "172." or RemoteIP startswith "192.168.")
+| project Timestamp, DeviceName, RemoteIP, RemotePort,
+         Process = InitiatingProcessFileName,
+         Command = InitiatingProcessCommandLine;
 
-// 3. Hybrid jitter model: per DeviceName+RemoteIP+RemotePort (interval mean/stddev/ratio)
-let IntervalStats =
+let BeaconStats =
 Raw
 | serialize
-| order by DeviceName,RemoteIP,RemotePort,Timestamp asc
-| extend PrevTime = iif(DeviceName == prev(DeviceName) and RemoteIP == prev(RemoteIP) and RemotePort == prev(RemotePort), prev(Timestamp), datetime(null))
-| extend IntervalSeconds = iif(isnotnull(PrevTime), datetime_diff("second", Timestamp, PrevTime), real(null))
+| order by DeviceName, RemoteIP, RemotePort, Timestamp asc
+| extend PrevTime = iif(DeviceName == prev(DeviceName) and RemoteIP == prev(RemoteIP) and RemotePort == prev(RemotePort),
+                         prev(Timestamp), datetime(null))
+| extend Interval = iif(isnotnull(PrevTime), datetime_diff("second", Timestamp, PrevTime), real(null))
 | summarize
-    FirstSeen=min(Timestamp),
-    LastSeen=max(Timestamp),
-    ConnCount=count(),
-    AvgIntervalSeconds=avg(IntervalSeconds),
-    StdIntervalSeconds=stdev(IntervalSeconds),
-    SampleProcess=any(InitiatingProcessFileName),
-    SampleCommand=any(InitiatingProcessCommandLine)
-    by DeviceName,RemoteIP,RemotePort;
+      FirstSeen=min(Timestamp),
+      LastSeen=max(Timestamp),
+      ConnectionCount=count(),
+      AvgInterval=avg(Interval),
+      StdInterval=stdev(Interval),
+      AnyProcess=any(Process),
+      AnyCommand=any(Command)
+      by DeviceName, RemoteIP, RemotePort;
 
-// 4. Join port metadata and compute risk + jitter score
-IntervalStats
-| join kind=inner (PortDetails) on $left.RemotePort == $right.dest_port
-| extend
-    // Basic risk from feed confidence
-    BaseRisk = case(
-        metadata_confidence == "high",   3,
-        metadata_confidence == "medium", 2,
-        1
-    ),
-    // Jitter scoring: only where we have enough intervals
-    HasIntervals = iif(ConnCount >= 5 and isfinite(AvgIntervalSeconds) and AvgIntervalSeconds > 0, 1, 0),
-    JitterRatio = iif(HasIntervals == 1, StdIntervalSeconds / AvgIntervalSeconds, real(0.0)),
-    JitterScore = case(
-        HasIntervals == 0, 0,
-        AvgIntervalSeconds between (10 .. 3600) and JitterRatio between (0.05 .. 0.6), 2,   // typical jittered beacon
-        AvgIntervalSeconds between (10 .. 3600) and JitterRatio < 0.05, 2,                  // almost fixed-interval beacon
-        0
-    ),
-    VolumeScore = case(
-        ConnCount >= 50, 2,
-        ConnCount >= 20, 1,
-        0
-    ),
-    TotalScore = BaseRisk + JitterScore + VolumeScore,
-    RiskLevel = case(
-        TotalScore >= 6, "CRITICAL",
-        TotalScore >= 4, "HIGH",
-        TotalScore >= 2, "MEDIUM",
-        "LOW"
-    ),
-    MITRE_Tactics = "TA0011: Command and Control",
-    MITRE_Techniques = case(
-        RemotePort == 1080, "T1090: Proxy",
-        RemotePort == 1194, "T1573: Encrypted Channel",
-        "T1071: Application Layer Protocol"
-    ),
-    ThreatHunterDirective = case(
-        RiskLevel == "CRITICAL",
-            strcat("CRITICAL: Likely C2 or tunnel on port ", tostring(RemotePort), ". Service: ", tostring(SampleProcess),
-                   ". Check jittered beacon pattern (Avg=", tostring(AvgIntervalSeconds), "s, JitterRatio=", tostring(round(JitterRatio,3)),
-                   "), review process tree and outbound infra."),
-        RiskLevel == "HIGH",
-            strcat("HIGH: Suspicious repeated connections on port ", tostring(RemotePort), ". Verify legitimacy of ", tostring(SampleProcess),
-                   " and inspect command line for tunneling or C2 behaviour."),
-        RiskLevel == "MEDIUM",
-            strcat("MEDIUM: Suspicious port usage. Validate business justification for connections to ", RemoteIP, " on port ", tostring(RemotePort), "."),
-        "LOW: Low-score hit. Use as context for larger investigations."
-    ),
-    HuntingDirectives = pack_array(
-        strcat("1. Verify legitimacy of process: ", SampleProcess),
-        strcat("2. Inspect command line: ", SampleCommand),
-        strcat("3. Review ", ConnCount, " connections to ", RemoteIP, " on port ", tostring(RemotePort)),
-        strcat("4. Examine timing pattern: AvgInterval=", tostring(AvgIntervalSeconds), "s, StdDev=", tostring(StdIntervalSeconds), "s, JitterRatio=", tostring(round(JitterRatio,3))),
-        strcat("5. Port context: ", metadata_comment),
-        "6. Correlate with DeviceProcessEvents for parent-child process tree",
-        "7. Check DeviceLogonEvents for user context and session details",
-        "8. Isolate endpoint and collect memory if activity is confirmed malicious"
-    )
-| where RiskLevel in ("CRITICAL","HIGH","MEDIUM") and ConnCount >= 3
-| project FirstSeen,LastSeen,DeviceName,RemoteIP,RemotePort,ConnCount,RiskLevel,TotalScore,AvgIntervalSeconds,StdIntervalSeconds,JitterRatio,PortContext=metadata_comment,Confidence=metadata_confidence,SampleProcess,SampleCommand,MITRE_Tactics,MITRE_Techniques,ThreatHunterDirective,HuntingDirectives,RuleName="Suspicious_Ports_Jitter_Beaconing"
-| order by TotalScore desc, ConnCount desc, FirstSeen desc
+BeaconStats
+| where ConnectionCount >= MinConnections
+| where AvgInterval between (MinIntervalSeconds .. MaxIntervalSeconds)
+| extend JitterRatio = StdInterval / AvgInterval
+| extend Score =
+       (iif(JitterRatio < 0.05, 3, 0)) +         // near-fixed interval
+       (iif(JitterRatio between (0.05 .. 0.6),2,0)) +  // jittered C2 pattern
+       (iif(ConnectionCount >= 20, 2, iif(ConnectionCount >= 10,1,0)))
+| where Score >= 3
+| project
+      FirstSeen, LastSeen, DeviceName, RemoteIP, RemotePort,
+      ConnectionCount, AvgInterval, StdInterval, JitterRatio,
+      Process=AnyProcess, Command=AnyCommand,
+      Score, RuleName="PortAgnostic_Jitter_Beaconing"
+| order by Score desc, ConnectionCount desc
