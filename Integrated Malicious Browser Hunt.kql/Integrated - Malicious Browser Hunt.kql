@@ -1,7 +1,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////////
 // Browser Extension Threat Detection — Behaviour + External Feed Integrated Feed + ForcedRegistry Writes
 // Rule Title: Browser_Extension_Threat_Detection
-// Author: Ala Dabat
+// Author: Ala Dabat (WORK IN PROGRESS)
 // Version: 2025-11
 // Category: Persistence / Initial Access / Supply-Chain
 // MITRE: T1176 (Browser Extensions), T1546 (Event Triggered Execution), T1059 (Script Execution)
