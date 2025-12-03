@@ -1,11 +1,11 @@
-# 🛡️ Advanced Registry Persistence Detection (KQL)
+# Advanced Registry Persistence Detection (KQL)
 High-fidelity detection logic for malicious registry-based persistence, execution hijacking, and defense evasion.  
 This rule uses **multi-signal scoring**, **prevalence analysis**, **trusted signer validation**, **LOLBin detection**,  
 and **content inspection** to isolate real attacks with minimal false positives.
 
 ---
 
-## ✅ What This Rule *Will* Detect
+##  What This Rule *Will* Detect
 
 | Category | Example Techniques / Indicators | Why It Triggers |
 |---------|---------------------------------|-----------------|
@@ -25,7 +25,7 @@ and **content inspection** to isolate real attacks with minimal false positives.
 
 ---
 
-## ❌ What This Rule *Will NOT* Detect
+##  What This Rule *Will NOT* Detect
 
 | Missed Category | Description | Why It's Not Covered |
 |-----------------|-------------|----------------------|
@@ -41,7 +41,7 @@ and **content inspection** to isolate real attacks with minimal false positives.
 
 ---
 
-# 🎯 Hunting Directives (SOC Analyst Guide)
+#  Hunting Directives (SOC Analyst Guide)
 
 ```markdown
 ### 🔎 Hunting Directives
@@ -80,7 +80,7 @@ and **content inspection** to isolate real attacks with minimal false positives.
 8. **Feed confirmed IOCs into MISP / TI pipeline**
    - Improve future scoring for similar TTPs.
 
-### 📊 MITRE ATT&CK Coverage Heatmap
+### MITRE ATT&CK Coverage Heatmap
 
 | Tactic | Techniques |
 |--------|------------|
