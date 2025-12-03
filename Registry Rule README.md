@@ -44,7 +44,7 @@ and **content inspection** to isolate real attacks with minimal false positives.
 #  Hunting Directives (SOC Analyst Guide)
 
 ```markdown
-### 🔎 Hunting Directives
+###  Hunting Directives
 
 1. **Validate the initiating process**
    - Check signer, company, path, and hash rarity.
