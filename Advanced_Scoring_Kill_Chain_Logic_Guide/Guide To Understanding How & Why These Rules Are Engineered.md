@@ -365,4 +365,4 @@ This architecture demonstrates:
 - Capability to express detection logic clearly  
 - SOC-ready analysis guidance for IR teams  
 
-This “hybrid” document is designed for analysts, engineers, and hiring managers to quickly understand **how** and **why** these hunts detect high-fidelity modern attacks.
+This “hybrid” document is designed for analysts, engineers, to quickly understand **how** and **why** these hunts detect high-fidelity modern attacks.
