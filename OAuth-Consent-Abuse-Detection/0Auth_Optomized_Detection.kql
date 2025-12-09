@@ -1,0 +1,134 @@
+// OAuth Consent Abuse Detection — High-Risk Grants & Usage (FIXED)
+// Author: Ala Dabat (Optimized)
+// MITRE: TA0001, TA0003, T1550.001
+
+let Lookback      = 30d; // Lookback for Consent (The persistence event)
+let UsageLookback = 7d;  // Lookback for Activity (The active abuse) - Kept shorter for performance
+let RiskThreshold = 10;
+
+let KnownSafeApps = dynamic([
+    "Microsoft Teams","SharePoint Online","Outlook Web App","OneDrive","Office 365 Portal",
+    "Exchange Online","Azure Portal","Microsoft Graph","Power BI","Intune","Azure AD Connect",
+    "Defender for Endpoint","Defender for Identity","Defender for Office 365"
+]);
+
+let KnownSafePublishers = dynamic([
+    "Microsoft Corporation","Microsoft Azure","Microsoft Online Services",
+    "Office 365 Exchange Online","Windows Azure Active Directory"
+]);
+
+let SuspiciousUserAgents = dynamic([
+    "python","curl","wget","http-client","go-http","okhttp","java","ruby",
+    "perl","postman","insomnia","rest-client","powershell"
+]);
+
+// Exact permission matches
+let HighRiskExact = dynamic([
+    "Application.ReadWrite.All","AppRoleAssignment.ReadWrite.All","RoleManagement.ReadWrite.Directory",
+    "ServicePrincipal.ReadWrite.All","Directory.ReadWrite.All","Directory.AccessAsUser.All",
+    "Mail.Read","Mail.ReadWrite","Mail.Send","MailboxSettings.ReadWrite",
+    "Files.ReadWrite.All","Sites.ReadWrite.All","Sites.FullControl.All",
+    "User.ReadWrite.All","Group.ReadWrite.All","offline_access"
+]);
+
+// Regex permission matches (FIXED SYNTAX)
+let HighRiskRegex = dynamic([
+  @"^(Application|AppRoleAssignment|ServicePrincipal|RoleManagement|Directory|Domain|Policy)\.(ReadWrite.*|AccessAsUser\.All)$",
+  @"^(AuditLog|Reports|Security|IdentityRisk(Event|yUser)|Threat)\.(Read.*|ReadWrite.*)$",
+  @"^(Mail|MailboxSettings)\.(Read.*|ReadWrite.*|Send)$",
+  @"^(Files|Sites)\.(Read.*|ReadWrite.*|FullControl\.All)$",
+  @"^(Group|User|Device)\.(ReadWrite.*)$",
+  @".*\.FullControl\.All$",
+  @".*\.ReadWrite\.All$"
+]);
+
+// --------------------------------------------------------
+// 1. Consent Events (The Persistence Hook)
+// --------------------------------------------------------
+let Consents =
+AuditLogs
+| where TimeGenerated >= ago(Lookback)
+| where OperationName in ("Consent to application", "Add delegated permission grant", "Add app role assignment grant to service principal")
+| where Result =~ "success"
+| extend Target = TargetResources[0]
+| extend AppId          = tostring(Target.id),
+         AppDisplayName = tostring(Target.displayName),
+         InitiatorUPN   = tostring(InitiatedBy.user.userPrincipalName),
+         IPAddress      = tostring(InitiatedBy.user.ipAddress),
+         UserAgent      = tostring(InitiatedBy.user.userAgent)
+// Robust Parsing
+| extend Props = Target.modifiedProperties
+| mv-expand P = Props
+| extend PropName = tostring(P.displayName), PropValue = tostring(P.newValue)
+| summarize 
+    IsAppOnlyRaw      = any(iff(PropName == "ConsentContext.IsAppOnly", PropValue, "")),
+    OnBehalfOfAllRaw  = any(iff(PropName == "ConsentContext.OnBehalfOfAll", PropValue, "")),
+    PublisherNameRaw  = any(iff(PropName == "ConsentContext.PublisherName", PropValue, "")),
+    DelegatedRaw      = any(iff(PropName == "Scope", PropValue, "")),
+    AppRolesRaw       = any(iff(PropName == "AppRoles", PropValue, "")),
+    CreatedTime       = min(TimeGenerated),
+    Initiator         = any(InitiatorUPN),
+    IPAddress         = any(IPAddress),
+    UserAgent         = any(UserAgent)
+  by AppId, AppDisplayName
+// Clean up values
+| extend IsAppOnly     = tobool(trim('"', IsAppOnlyRaw)),
+         OnBehalfAll   = tobool(trim('"', OnBehalfOfAllRaw)),
+         PublisherName = trim('"', PublisherNameRaw),
+         // Combine Delegated Scopes and App Roles into one list
+         AllPerms      = array_concat(
+                            split(replace_string(trim('"', DelegatedRaw), '"', ''), " "), 
+                            split(replace_string(trim('"', AppRolesRaw), '"', ''), " ")
+                         )
+| mv-expand Permission = AllPerms to typeof(string)
+| where isnotempty(Permission)
+// Check against Risk Lists
+| extend IsHighRisk = iif(Permission in (HighRiskExact) or array_length(array_filter(HighRiskRegex, (re:string) => Permission matches regex re)) > 0, 1, 0)
+| summarize 
+    HighRiskCount = sum(IsHighRisk),
+    HighRiskPerms = make_set_if(Permission, IsHighRisk == 1, 100),
+    AllPerms      = make_set(Permission, 100),
+    PublisherName = any(PublisherName),
+    CreatedTime   = any(CreatedTime),
+    Initiator     = any(Initiator),
+    UserAgent     = any(UserAgent)
+  by AppId, AppDisplayName, IsAppOnly, OnBehalfAll;
+
+// --------------------------------------------------------
+// 2. Usage Correlation (The Active Abuse)
+// --------------------------------------------------------
+
+// Check if Service Principal is actually signing in (Automated Abuse)
+let SPActivity =
+ServicePrincipalSignInLogs
+| where TimeGenerated >= ago(UsageLookback)
+| summarize SPCalls = count(), LastSP = max(TimeGenerated) by AppId;
+
+// Check if Users are signing into it (Graph/Token usage)
+let UserActivity =
+SigninLogs
+| where TimeGenerated >= ago(UsageLookback)
+| summarize UserSignins = count(), LastUser = max(TimeGenerated) by AppId;
+
+// --------------------------------------------------------
+// 3. Final Correlation & Scoring
+// --------------------------------------------------------
+Consents
+| join kind=leftouter SPActivity on AppId
+| join kind=leftouter UserActivity on AppId
+// Calculate Risk Score
+| extend RiskScore = 
+      (HighRiskCount * 2) // Heavy weight on dangerous permissions
+    + (iif(OnBehalfAll, 5, 0)) // Admin Consent is dangerous
+    + (iif(PublisherName in~ (KnownSafePublishers), 0, 5)) // Unknown publisher
+    + (iif(SPCalls > 0 or UserSignins > 0, 5, 0)) // Active Usage increases urgency
+| where RiskScore >= RiskThreshold
+| extend Severity = case(RiskScore >= 20, "Critical", RiskScore >= 15, "High", "Medium")
+| extend HunterDirective = strcat(
+    "Review App '", AppDisplayName, "' (", AppId, "). ",
+    "Publisher: ", PublisherName, ". ",
+    "Granted ", tostring(HighRiskCount), " high-risk permissions: ", tostring(HighRiskPerms), ". ",
+    "Active Usage Detected: ", iif(SPCalls > 0 or UserSignins > 0, "YES", "NO")
+)
+| project CreatedTime, Severity, RiskScore, AppDisplayName, AppId, PublisherName, Initiator, HighRiskCount, HighRiskPerms, SPCalls, UserSignins, HunterDirective
+| order by RiskScore desc
