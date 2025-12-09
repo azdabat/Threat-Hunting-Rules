@@ -1,0 +1,160 @@
+//////////////////////////////////////////////////////////////////////////////////
+// Advanced Hunt: SilverFox_ValleyRat_Full_KillChain_Advanced
+// Author: Ala Dabat
+// Version: 2025-12
+// Purpose:
+//   High-context hunt for SilverFox / ValleyRat activity across the full chain:
+//   - DLL sideloading via legitimate or fake loaders
+//   - BYOVD driver drop + optional service creation
+//   - Security product tampering (fltmc / WinDefend)
+//   - Credential access and keylogger service patterns
+//   - Lateral movement (WMI/PowerShell remoting)
+//   - Data staging + exfiltration via HTTPS
+//
+// Notes:
+//   - Behavioural first approach; no dependence on specific hashes or driver names.
+//   - Intended for L3 threat hunters and advanced detection engineering rulepacks.
+//////////////////////////////////////////////////////////////////////////////////
+
+// Advanced Hunt: SilverFox_ValleyRat_Full_KillChain_Advanced
+// Author: Ala Dabat (Optimized by Gemini)
+// Version: 2025-12
+//
+// Purpose:
+//    High-fidelity detection of SilverFox/ValleyRat kill chains, robust to file renaming and path variations.
+//    Tracks: Sideloading -> BYOVD/Rootkit -> Tampering -> Lateral Movement -> Exfil.
+//
+// Logic Update (Severity vs. Filtering):
+//    - BASELINE (Medium): Valid Sideloading Event (Signed Loader in User Path).
+//    - UPGRADE (High): Presence of Driver Drops, Service Creation, or Persistence.
+//    - UPGRADE (Critical): Presence of Tampering, Credential Theft, or Exfiltration.
+
+let Lookback = 48h;
+let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\"]);
+
+// ============================================================================================
+// 1. CORE SPINE: Sideloading (The Anchor Event)
+// ============================================================================================
+let SideloadEvents =
+DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where FileName endswith ".dll"
+// FIX: Catch Loaders running from User Paths (SilverFox standard) AND Program Files
+| where InitiatingProcessFolderPath has_any (WritablePaths) or InitiatingProcessFolderPath has "Program Files"
+// DLL must be in a user-writable path (The anomaly)
+| where FolderPath has_any (WritablePaths)
+// The Loader must be Signed (Abuse of Trust)
+| where InitiatingProcessSignatureStatus == "Signed" 
+| project DeviceId, SideloadTime=Timestamp, LoaderName=InitiatingProcessFileName, LoaderPath=InitiatingProcessFolderPath, LoaderPid=InitiatingProcessId, LoadedDll=FileName, LoadedDllPath=FolderPath;
+
+// ============================================================================================
+// 2. ENRICHMENT: The Kill Chain Components
+// ============================================================================================
+
+// A. Driver Drops (BYOVD Staging) - Tracks .sys, .dat, .tmp in user paths
+let DriverDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where FileName has_any (".sys", ".dat", ".tmp") and FolderPath has_any (WritablePaths)
+| project DeviceId, DropTime=Timestamp, DriverFile=FileName, DriverFolder=FolderPath, DropperPid=InitiatingProcessId;
+
+// B. Service Creation (Persistence/Rootkit) - Covers SC.exe AND Registry APIs
+let ServiceEvents =
+union
+(DeviceProcessEvents | where FileName in~ ("sc.exe", "pnputil.exe") and ProcessCommandLine has_any (".sys", "binPath") | extend SvcMethod="Process"),
+(DeviceRegistryEvents | where RegistryKey has "Services" and RegistryValueName == "ImagePath" | extend SvcMethod="Registry")
+| where Timestamp > ago(Lookback)
+| project DeviceId, SvcTime=Timestamp, SvcCmd=coalesce(ProcessCommandLine, RegistryKey), SvcMethod, SvcPid=InitiatingProcessId;
+
+// C. Security Tampering (Blind the SOC)
+let Tampering =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where (FileName =~ "fltmc.exe" and ProcessCommandLine has "unload") 
+   or (ProcessCommandLine has_any ("Stop-Service", "WinDefend", "MsMpEng", "Sense", "Add-MpPreference", "-ExclusionPath"))
+| project DeviceId, TamperTime=Timestamp, TamperCmd=ProcessCommandLine, TamperPid=InitiatingProcessId;
+
+// D. Credential Theft / Keylogging
+let Creds =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where ProcessCommandLine has_any ("--steal", "dump", "lsass", "comsvcs.dll", "MiniDump")
+| project DeviceId, CredTime=Timestamp, CredCmd=ProcessCommandLine, CredPid=InitiatingProcessId;
+
+// E. Exfiltration / Staging
+let Exfil =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where (FileName in~ ("7z.exe", "rar.exe") and ProcessCommandLine has " a ") // Staging
+   or (ProcessCommandLine has_any ("curl", "wget", "bitsadmin") and ProcessCommandLine has "http") // Exfil
+| project DeviceId, ExfilTime=Timestamp, ExfilCmd=ProcessCommandLine, ExfilPid=InitiatingProcessId;
+
+// ============================================================================================
+// 3. CORRELATION & AGGREGATION
+// ============================================================================================
+
+SideloadEvents
+// Join enrichment data. We use LeftOuter because we want to see the Sideload even if the rest hasn't happened yet.
+| join kind=leftouter (DriverDrops) on DeviceId
+    | where isnull(DropTime) or (DropTime between (SideloadTime .. SideloadTime + 1h))
+| join kind=leftouter (ServiceEvents) on DeviceId
+    | where isnull(SvcTime) or (SvcTime between (SideloadTime .. SideloadTime + 2h))
+| join kind=leftouter (Tampering) on DeviceId
+    | where isnull(TamperTime) or (TamperTime between (SideloadTime .. SideloadTime + 4h))
+| join kind=leftouter (Creds) on DeviceId
+    | where isnull(CredTime) or (CredTime between (SideloadTime .. SideloadTime + 4h))
+| join kind=leftouter (Exfil) on DeviceId
+    | where isnull(ExfilTime) or (ExfilTime between (SideloadTime .. SideloadTime + 4h))
+
+// Summarize into a Single Incident per Device
+| summarize 
+    FirstSeen       = min(SideloadTime),
+    LastSeen        = max(coalesce(ExfilTime, CredTime, TamperTime, SvcTime, DropTime, SideloadTime)),
+    LoaderName      = any(LoaderName),
+    LoaderPath      = any(LoaderPath),
+    LoadedDlls      = make_set(LoadedDll, 10),
+    DriverFiles     = make_set(DriverFile, 10),
+    ServiceCmds     = make_set(SvcCmd, 10),
+    TamperCmds      = make_set(TamperCmd, 10),
+    ExfilCmds       = make_set(ExfilCmd, 10),
+    
+    // Boolean Signals for Scoring
+    HasDrivers      = max(iif(isnotempty(DriverFile), 1, 0)),
+    HasService      = max(iif(isnotempty(SvcCmd), 1, 0)),
+    HasTamper       = max(iif(isnotempty(TamperCmd), 1, 0)),
+    HasCreds        = max(iif(isnotempty(CredCmd), 1, 0)),
+    HasExfil        = max(iif(isnotempty(ExfilCmd), 1, 0))
+    by DeviceId
+
+// ============================================================================================
+// 4. SEVERITY & DIRECTIVE LOGIC
+// ============================================================================================
+
+| extend Severity = case(
+    // CRITICAL: Sideload + (Tampering OR Exfil OR Creds) -> Active Hands-on-Keyboard
+    HasTamper == 1 or HasExfil == 1 or HasCreds == 1, "Critical",
+    
+    // HIGH: Sideload + (Drivers OR Service) -> Confirmed Rootkit/Persistence Install
+    HasDrivers == 1 or HasService == 1, "High",
+    
+    // MEDIUM: Valid Sideload Detected (Suspicious, requires investigation)
+    "Medium"
+)
+
+| extend HunterDirective = case(
+    Severity == "Critical", 
+        strcat("CRITICAL: Active SilverFox/ValleyRat Killchain. Signed Loader (", LoaderName, ") executed from ", LoaderPath, 
+        ". Confirmed Sideloading of ", tostring(LoadedDlls), 
+        ". ATTACK ESCALATION: Security Tampering (", tostring(TamperCmds), ") or Exfiltration (", tostring(ExfilCmds), ") detected. IMMEDIATE ISOLATION REQUIRED."),
+    
+    Severity == "High", 
+        strcat("HIGH: BYOVD / Rootkit Installation Detected. Signed Loader (", LoaderName, ") dropped driver files ", tostring(DriverFiles), 
+        " and attempted Service Creation via ", tostring(ServiceCmds), 
+        ". Check for hidden Rootkits and Kernel Services."),
+    
+    // Severity == Medium
+        strcat("MEDIUM: Suspicious Sideloading Detected. Signed Binary (", LoaderName, ") loaded DLL (", tostring(LoadedDlls), ") from User Writable Path. Verify if this is a legitimate portable application.")
+)
+
+| project FirstSeen, LastSeen, Severity, DeviceId, LoaderName, LoaderPath, LoadedDlls, DriverFiles, ServiceCmds, TamperCmds, ExfilCmds, HunterDirective
+| order by Severity desc, LastSeen desc
