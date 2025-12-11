@@ -24,14 +24,13 @@ These rules form a unified **Kerberos Attack Cluster**, correlating endpoint and
 
 ## Attack Chain Diagram (GitHub-Compatible Mermaid)
 
-```mermaid
 flowchart TD
-    A[LSASS / Credential Dumping<br>(sekurlsa::tickets, logonpasswords)] --> B[PTT / Golden Ticket Forging<br>(kerberos::golden / rc4 / aes256)]
-    B --> C[Ticket Injection / Overpass-the-Hash<br>(sekurlsa::pth,<br>-hashes)]
-    C --> D[Kerberoasting<br>(TGS SPN Spray)]
-    D --> E[Privilege Escalation / Lateral Movement<br>(Service Account Impersonation)]
+    A["LSASS / Credential Dumping\n(sekurlsa::tickets, sekurlsa::logonpasswords)"]
+        --> B["Golden / Silver Ticket Forging\n(kerberos::golden, rc4, aes256)"]
+    B --> C["Pass-the-Hash / Ticket Injection\n(sekurlsa::pth, -hashes, /ptt)"]
+    C --> D["Kerberoasting / SPN Spray\n(TGS requests, RC4-HMAC)"]
+    D --> E["Privilege Escalation & Lateral Movement\n(Service account impersonation)"]
 
-```
 MITRE ATT&CK Coverage
 
 | Technique         | Description                     | Rules Detecting            |
