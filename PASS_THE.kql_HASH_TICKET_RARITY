@@ -1,0 +1,189 @@
+// ============================================================================
+// L3_PASS_THE_HASH_TICKET_RARITY_V1
+// Author: Ala Dabat
+// Purpose: Detect Pass-the-Hash / Pass-the-Ticket style lateral movement by
+//          identifying successful Kerberos/NTLM authentications to hosts
+//          the user has little or no historical relationship with.
+// Criteria: User-to-Host Rarity: (NewHosts / TotalRecentHosts) >= 0.90
+// Tactics: TA0008 Lateral Movement | TA0006 Credential Access
+// Techniques: T1078 (Valid Accounts), T1021 (Remote Services), T1550.002 (PtH), T1550.003 (PtT)
+// Data: DeviceLogonEvents (MDE)
+// ============================================================================
+
+let BaselineLookback = 30d;
+let DetectionLookback = 7d;
+let DriftThreshold = 0.90;   // >90% of accessed hosts are new
+
+// ------------------------------------------------------------------
+// 1. BASELINE — Historical User → Host relationships (Kerberos / NTLM)
+// ------------------------------------------------------------------
+let HistoricalUserHosts =
+DeviceLogonEvents
+| where Timestamp between (ago(BaselineLookback)..ago(DetectionLookback))
+| where ActionType == "LogonSuccess"
+| where LogonType in ("Network", "RemoteInteractive")
+| where AuthenticationPackage in ("Kerberos", "NTLM")
+| extend
+    User = tolower(AccountName),
+    Host = tolower(DeviceName)
+| summarize
+    HistoricalHosts = make_set(Host, 1000)
+  by User;
+
+// ------------------------------------------------------------------
+// 2. DETECTION WINDOW — Recent successful Kerberos / NTLM logons
+// ------------------------------------------------------------------
+let RecentUserHosts =
+DeviceLogonEvents
+| where Timestamp >= ago(DetectionLookback)
+| where ActionType == "LogonSuccess"
+| where LogonType in ("Network", "RemoteInteractive")
+| where AuthenticationPackage in ("Kerberos", "NTLM")
+| extend
+    LogonTime = Timestamp,
+    User = tolower(AccountName),
+    Host = tolower(DeviceName),
+    SourceDevice = tolower(InitiatingDeviceName)
+| summarize
+    FirstSeen = min(LogonTime),
+    LastSeen  = max(LogonTime),
+    RecentHosts = make_set(Host, 100),
+    LogonCount = count(),
+    SourceDevices = make_set(SourceDevice, 10)
+  by User;
+
+// ------------------------------------------------------------------
+// 3. DRIFT CALCULATION — How many hosts are NEW?
+// ------------------------------------------------------------------
+RecentUserHosts
+| join kind=leftouter (HistoricalUserHosts) on User
+| extend
+    HistoricalHosts = coalesce(HistoricalHosts, dynamic([])),
+    TotalRecentHosts = array_length(RecentHosts),
+    NewHosts = set_difference(RecentHosts, HistoricalHosts),
+    NewHostCount = array_length(NewHosts)
+| extend
+    DriftRatio = iif(TotalRecentHosts == 0, 0.0, todouble(NewHostCount) / todouble(TotalRecentHosts))
+
+// ------------------------------------------------------------------
+// 4. FILTER — Strong PtH / PtT signal
+// ------------------------------------------------------------------
+| where TotalRecentHosts >= 3                  // Avoid 1-off noise
+| where DriftRatio >= DriftThreshold           // >90% new hosts
+| where User !in (
+    "system", "local service", "network service",
+    "anonymous logon"
+)
+
+// ------------------------------------------------------------------
+// 5. SCORING & SEVERITY
+// ------------------------------------------------------------------
+| extend
+    RiskScore =
+        5                                     // Base lateral movement
+        + iif(NewHostCount >= 5, 3, 0)        // Multiple new hosts
+        + iif(array_length(SourceDevices) >= 2, 3, 0), // Credential reuse from multiple sources
+
+    Severity = case(
+        DriftRatio >= 0.95 and NewHostCount >= 5, "CRITICAL",
+        DriftRatio >= 0.90, "HIGH",
+        "MEDIUM"
+    )
+
+| extend
+    HuntingDirective = case(
+        Severity == "CRITICAL",
+        "CRITICAL: Strong Pass-the-Hash/Ticket pattern. User authenticated to many hosts never seen before using Kerberos/NTLM. Treat as credential compromise + lateral movement. Investigate source device(s), reset creds, and hunt LSASS/ticket theft.",
+        Severity == "HIGH",
+        "HIGH: Significant host drift using Kerberos/NTLM. Validate whether this aligns with admin activity; if not, treat as lateral movement. Investigate source device and follow-on access.",
+        "MEDIUM: Unusual host drift. Validate role change, new project access, or legitimate admin operations."
+    )
+
+// ------------------------------------------------------------------
+// 6. FINAL OUTPUT
+// ------------------------------------------------------------------
+| project
+    Severity,
+    RiskScore,
+    HuntingDirective,
+    FirstSeen,
+    LastSeen,
+    User,
+    TotalRecentHosts,
+    NewHostCount,
+    DriftRatio,
+    NewHosts,
+    SourceDevices,
+    LogonCount
+| order by RiskScore desc, LastSeen desc;
+
+// ============================================================================
+// INCIDENT RESPONSE / REMEDIATION (SOC RUNBOOK — IR FRAMEWORK)
+// Apply for HIGH/CRITICAL results.
+// ============================================================================
+//
+// A) TRIAGE (5–15 minutes)
+//    1) Validate the event is truly "remote" lateral movement:
+//       - Confirm LogonType is Network or RemoteInteractive.
+//       - Confirm AuthenticationPackage is Kerberos or NTLM.
+//    2) Confirm abnormality:
+//       - DriftRatio >= 0.90 and NewHostCount >= 3 indicates major behavior shift.
+//    3) Identify likely patient-zero:
+//       - Review SourceDevices; prioritize unknown/new source devices for the user.
+//    4) Quick context checks:
+//       - Is the user an administrator? On-call? New role/project? Deployment window?
+//       - Is the target host part of an admin jump box pool or standard server fleet?
+//
+// B) CONTAINMENT (IMMEDIATE ACTIONS)
+//    1) If CRITICAL:
+//       - Isolate the highest-suspicion SourceDevice(s) if feasible.
+//       - Disable the account temporarily OR enforce password reset + revoke sessions.
+//    2) If HIGH:
+//       - Restrict lateral movement paths (firewall/RDP/SMB) for the SourceDevice(s).
+//       - Increase monitoring on the user + accessed hosts.
+//
+// C) INVESTIGATION (DEPTH STEPS)
+//    1) Source device investigation (credential theft origin):
+//       - Hunt for LSASS access / dumping:
+//         - Suspicious handle access to lsass.exe, procdump/rundll32/comsvcs usage, mimikatz indicators.
+//       - Hunt for abnormal process trees (Office/Browser -> LOLBin -> injection).
+//    2) Destination host investigation (lateral foothold):
+//       - Look for new services, scheduled tasks, Run keys, WMI persistence.
+//       - Review recent remote process execution (PsExec/WMI/WinRM), file drops, and admin shares.
+//    3) Authentication narrative:
+//       - If possible, enrich using DC telemetry (SecurityEvent 4624 / 4768 / 4769) to confirm:
+//         - WorkstationName/SourceIP, LogonProcess, ticket types, unusual ticket options.
+//    4) Spread assessment:
+//       - Pivot on User across last 24h/7d for additional NewHosts.
+//       - Pivot on SourceDevices to see other users impacted (credential spraying or token theft).
+//
+// D) ERADICATION
+//    1) Reset credentials:
+//       - Force password reset for the impacted user.
+//       - Revoke sessions/tokens where applicable.
+//    2) Remove attacker persistence on any impacted hosts:
+//       - Delete malicious tasks/services/runkeys; quarantine payloads.
+//    3) Patch / harden:
+//       - Apply LSASS protections (RunAsPPL where possible).
+//       - Enable/validate Credential Guard and LSA protections if supported.
+//       - Ensure Defender Tamper Protection is enabled.
+//
+// E) RECOVERY
+//    1) Validate clean state:
+//       - No ongoing rare logons for the user.
+//       - No new persistence artifacts.
+//    2) Reconnect isolated devices after remediation and full AV/EDR scan.
+//    3) Monitor for re-compromise (24–72h heightened monitoring).
+//
+// F) PREVENTION / DETECTION IMPROVEMENTS
+//    1) Add allowlists for known admin jump hosts and approved automation accounts.
+//    2) Create a companion rule for:
+//       - SourceDevice-to-Host drift (device suddenly authenticating to many new hosts).
+//       - Burst lateral movement (many hosts in short time).
+//    3) Enforce tiering model:
+//       - Separate admin workstations from user endpoints.
+//       - Limit where privileged accounts can authenticate.
+//
+// ============================================================================
+// END
+// ============================================================================
