@@ -1,21 +1,35 @@
-// Rule: L3_SPN_First_Login_V5
+// Rule: L3_SPN_Suspicious_First_Login_V6
 // Author: Ala Dabat
-// Purpose: Detect first-ever SPN logins.
-// Data: AADServicePrincipalSignInLogs
-// MITRE: T1078.004, T1098
+// Purpose: Detect first-ever SPN logins with behavioral "Hot" indicators (New IP + Non-Internal).
 
-let history = 30d;
+let history = 90d; // Expanded history for better baseline
 let lookback = 24h;
 
-let Logins = AADServicePrincipalSignInLogs
-| where TimeGenerated > ago(history);
+// 1. Identify "Known" SPNs and their typical IPs
+let KnownContext = AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(history) and TimeGenerated < ago(lookback)
+| summarize KnownIPs = make_set(IPAddress) by ServicePrincipalId;
 
-let FirstSeen = Logins
-| summarize FirstSeen=min(TimeGenerated) 
-    by ServicePrincipalId, ServicePrincipalName;
+// 2. Identify New Logins within the lookback
+let NewLogins = AADServicePrincipalSignInLogs
+| where TimeGenerated > ago(lookback)
+| where ResultType == 0 // Only successful logins
+| join kind=leftanti KnownContext on ServicePrincipalId;
 
-FirstSeen
-| where FirstSeen > ago(lookback)
-| extend Severity="Medium", RiskScore=50,
-         Hunter_Directive=strcat("First login for SPN '", ServicePrincipalName, "'")
-| project Severity, RiskScore, ServicePrincipalId, ServicePrincipalName, FirstSeen, Hunter_Directive
+// 3. Score the New Logins based on risk
+NewLogins
+| extend isNewIP = iif(IPAddress !in (KnownContext), 1, 0)
+| extend isUnusualUserAgent = iif(UserAgent has_any ("python", "powershell", "curl", "postman"), 1, 0)
+| extend RiskScore = 20 
+    + iif(isNewIP == 1, 30, 0) 
+    + iif(isUnusualUserAgent == 1, 30, 0)
+| summarize 
+    FirstSeen = min(TimeGenerated), 
+    IPs = make_set(IPAddress), 
+    Locations = make_set(Location),
+    UserAgents = make_set(UserAgent),
+    FinalRisk = max(RiskScore)
+    by ServicePrincipalId, ServicePrincipalName
+| where FinalRisk >= 50 // Suppression: Ignore low-risk new SPNs
+| extend Severity = case(FinalRisk >= 80, "High", FinalRisk >= 50, "Medium", "Low")
+| extend Hunter_Directive = strcat("First seen login for SPN '", ServicePrincipalName, "' from unusual context: ", tostring(IPs))
