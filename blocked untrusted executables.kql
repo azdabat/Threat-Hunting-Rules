@@ -1,22 +1,121 @@
-//blocked untrusted executables
-// Ala Dabat
-// Query parameters:
+// ============================================================================
+// L3_Untrusted_Executable_Behavioral_Chain_Hunt
+// Author: Ala Dabat
+// Type: Threat Hunt (Advanced, NOT scheduled)
+// Audience: L3 Threat Hunters / DFIR
+//
+// Focus:
+//   - ASR execution attempts
+//   - Tenant rarity
+//   - Parent-child execution intent
+//   - Near-time network + follow-on activity
+// ============================================================================
+
+let lookback = 30d;
+let detection_window = 24h;
+let rarity_threshold = 3;
+let correlation_window = 10m;
+
+// High-risk parent processes
+let HighRiskParents = dynamic([
+  "outlook.exe","winword.exe","excel.exe","powerpnt.exe",
+  "chrome.exe","msedge.exe","firefox.exe",
+  "powershell.exe","pwsh.exe","cmd.exe",
+  "wscript.exe","cscript.exe","mshta.exe","rundll32.exe"
+]);
+
+// ------------------------------------------------------------------
+// 1) ASR execution attempts
+// ------------------------------------------------------------------
+let AsrExecAttempts =
 DeviceEvents
-| where Timestamp > ago(30d)
+| where Timestamp >= ago(detection_window)
 | where ActionType in ("AsrUntrustedExecutableAudited","AsrUntrustedExecutableBlocked")
-| summarize arg_min(Timestamp,*), LocalPrevalence = dcount(DeviceId) by SHA1, FileName
-| where Timestamp > ago(1d)
-| where LocalPrevalence <= 5
-// there might be files without signature info, perform leftouter join
-| join kind=leftouter (
-    DeviceFileCertificateInfo
-    | where Timestamp > ago(30d)
-    | summarize arg_max(Timestamp,*) by SHA1
+| extend FileHash = coalesce(SHA256, SHA1, InitiatingProcessSHA256)
+| project
+    EventTime = Timestamp,
+    DeviceId,
+    DeviceName,
+    FileName,
+    FolderPath,
+    FileHash,
+    ParentProcess = InitiatingProcessParentFileName,
+    ParentCommandLine = InitiatingProcessCommandLine;
+
+// ------------------------------------------------------------------
+// 2) Tenant rarity
+// ------------------------------------------------------------------
+let TenantRarity =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| summarize SeenOnDevices = dcount(DeviceId) by SHA256;
+
+// ------------------------------------------------------------------
+// 3) Follow-on process activity
+// ------------------------------------------------------------------
+let ProcActivity =
+DeviceProcessEvents
+| where Timestamp >= ago(detection_window)
+| project
+    ProcTime = Timestamp,
+    DeviceId,
+    ChildProcess = FileName,
+    ChildCommandLine = ProcessCommandLine,
+    ParentProcess = InitiatingProcessFileName;
+
+// ------------------------------------------------------------------
+// 4) Near-time network activity
+// ------------------------------------------------------------------
+let NetActivity =
+DeviceNetworkEvents
+| where Timestamp >= ago(detection_window)
+| where ActionType == "ConnectionSuccess"
+| project
+    NetTime = Timestamp,
+    DeviceId,
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    InitiatingProcessFileName;
+
+// ------------------------------------------------------------------
+// 5) Correlate everything
+// ------------------------------------------------------------------
+AsrExecAttempts
+| join kind=leftouter TenantRarity on $left.FileHash == $right.SHA256
+| join kind=leftouter ProcActivity on DeviceId
+| where isnull(ProcTime) or ProcTime between (EventTime .. EventTime + correlation_window)
+| join kind=leftouter NetActivity on DeviceId
+| where isnull(NetTime) or NetTime between (EventTime .. EventTime + correlation_window)
+| extend
+    IsRare = iif(coalesce(SeenOnDevices,0) <= rarity_threshold, 1, 0),
+    HighRiskParent = iif(ParentProcess in~ (HighRiskParents), 1, 0),
+    HasNetwork = iif(isnotempty(RemoteIP) or isnotempty(RemoteUrl), 1, 0)
+| extend ConfidenceScore =
+      (HighRiskParent * 30)
+    + (IsRare * 40)
+    + (HasNetwork * 20)
+    + 10   // ASR anchor
+| where ConfidenceScore >= 60
+| extend HunterDirective =
+    case(
+        HasNetwork == 1,
+        "L3: Probable loader execution attempt. ASR event followed by process activity and outbound network. Inspect full process tree, capture memory if possible, and block remote endpoint.",
+        "L3: Rare executable blocked by ASR from high-risk parent. Validate binary provenance and pivot across estate for same hash/path."
     )
-    on SHA1
-// Get GlobalPrevalence info, etc.
-| invoke FileProfile(SHA1, 1000)
-// GlobalFirstSeen can be used for filtering the results further
-// If you want to list only the files that have invalid signatures uncomment the below line
-// there might be files without signature info, don't exclude them
-// | where IsTrusted <> 1
+| project
+    EventTime,
+    DeviceName,
+    FileName,
+    FolderPath,
+    ParentProcess,
+    ParentCommandLine,
+    ChildProcess,
+    ChildCommandLine,
+    RemoteIP,
+    RemotePort,
+    RemoteUrl,
+    SeenOnDevices,
+    ConfidenceScore,
+    HunterDirective
+| order by ConfidenceScore desc, EventTime desc;
