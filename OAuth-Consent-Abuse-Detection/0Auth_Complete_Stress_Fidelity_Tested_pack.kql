@@ -1,28 +1,4 @@
 ////////////////////////////////////////////////////////////////////////////////
-// OAuth Analytic Pack — Consent Abuse, Token Theft, SP Credential Abuse
-// Author: Ala Dabat
-// Version: 2025-12 (V4)
-//
-// Contents:
-//   1) OAuth_Consent_Abuse_V4
-//        New high-risk OAuth grants (delegated + app roles) + usage context
-//
-//   2) OAuth_Token_Theft_SuspiciousUsage_V2
-//        Suspicious use of existing OAuth tokens from new geo / ASN / UA
-//        (no new consent needed)
-//
-//   3) OAuth_SP_Credential_Additions_V2
-//        New secrets/keys on service principals (backdoor existing apps)
-//
-// Design notes:
-//   - Everything is written to be readable under pressure.
-//   - Scoring is deliberately simple and comment-documented so you can talk
-//     through it in an interview without looking like it came from a black box.
-//   - These are hunting queries first. Promote to analytics once tuned per tenant.
-////////////////////////////////////////////////////////////////////////////////
-
-
-////////////////////////////////////////////////////////////////////////////////
 // 1) OAuth_Consent_Abuse_V4
 //    New high-risk grants + basic risk engine
 //
