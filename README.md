@@ -13,6 +13,10 @@
 
 ---
 
+> [!NOTE]  
+> This portfolio is actively evolving. For Production ready hunts see Core Hunts as this function of advanced detection rules is still in its test phase. Of course you are welcome to use a modify as you please. As this is an early stage repo finalization will take some time.
+> The repository reflects a live engineering process, where new rules, matrices and SOPs are continuously refined against modern attack patterns. Basic hunt pack will eventually be included all in due course.
+
 # 1. Overview
 
 This repository contains two layers of detection logic:
