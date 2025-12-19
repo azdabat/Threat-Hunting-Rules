@@ -104,4 +104,240 @@ DeviceProcessEvents
 | where not(IsAllowlistedSpawn)
 | project
     SpawnTime = Timestamp,
-    DeviceId, DeviceName
+    DeviceId, DeviceName,
+    LolbinPid = ProcessId,
+    Lolbin = FileName,
+    LolbinCmd = ProcessCommandLine,
+    Parent = InitiatingProcessFileName,
+    ParentCmd = InitiatingProcessCommandLine,
+    User = InitiatingProcessAccountName,
+    ParentPid = InitiatingProcessId;
+
+// ============================================================================
+// PHASE 2 — Injection Evidence (ActionType-based; summarized per Injector PID)
+// Focus: Injector is the LOLBin; increase confidence if target is high-value.
+// ============================================================================
+
+let InjectionEvidence =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("CreateRemoteThread","WriteProcessMemory","QueueUserAPC","ProcessTampering","ProcessInjection","ProcessHollowing")
+| project
+    InjectTime = Timestamp,
+    DeviceId,
+    InjectorPid = InitiatingProcessId,
+    InjectionAction = ActionType,
+    InjectionTargetPid = ProcessId
+| summarize
+    FirstInjectTime = min(InjectTime),
+    InjectActions = make_set(InjectionAction, 10),
+    TargetPids = make_set(InjectionTargetPid, 15)
+  by DeviceId, InjectorPid;
+
+// Map target PIDs to target process names (best-effort)
+let TargetNameMap =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| project DeviceId, TargetPid=ProcessId, TargetName=FileName
+| summarize arg_max(TargetName, *) by DeviceId, TargetPid;
+
+// ============================================================================
+// PHASE 3 — Ghost DLL / Suspicious Module Loads (secondary evidence)
+// ============================================================================
+
+let GhostLoads =
+DeviceImageLoadEvents
+| where Timestamp >= ago(lookback)
+| where FolderPath has_any (WritableUserPaths)
+| extend Sig = tostring(FileSignatureStatus)
+| where isempty(Sig) or Sig != "Signed"
+| project
+    LoadTime = Timestamp,
+    DeviceId,
+    LoaderPid = InitiatingProcessId,
+    LoadedImage = FileName,
+    LoadPath = FolderPath,
+    LoadedImageSHA1 = SHA1,
+    LoadedImageSigner = tostring(Signer)
+| summarize
+    FirstLoadTime = min(LoadTime),
+    LoadCount = count(),
+    SampleLoadedImages = make_set(LoadedImage, 5),
+    SampleLoadPaths = make_set(LoadPath, 5),
+    SampleLoadedSHA1 = make_set(LoadedImageSHA1, 5),
+    SampleLoadedSigners = make_set(LoadedImageSigner, 5)
+  by DeviceId, LoaderPid;
+
+// ============================================================================
+// PHASE 4 — Network Beacon Correlation (secondary evidence)
+// ============================================================================
+
+let Beacons =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("ConnectionSuccess","ConnectionAttempt")
+| project
+    NetTime = Timestamp,
+    DeviceId,
+    ProcPid = InitiatingProcessId,
+    RemoteIP = tostring(RemoteIP),
+    RemoteUrl = tostring(RemoteUrl),
+    RemotePort = toint(RemotePort),
+    Protocol = tostring(Protocol)
+| summarize
+    FirstNetTime = min(NetTime),
+    NetCount = count(),
+    Ports = make_set(RemotePort, 10),
+    RemoteIPs = make_set(RemoteIP, 10),
+    RemoteUrls = make_set(RemoteUrl, 10),
+    Protocols = make_set(Protocol, 5)
+  by DeviceId, ProcPid;
+
+// ============================================================================
+// CORRELATION & UNIFIED SCORING (Injection-first / Graceful Degradation)
+// ============================================================================
+
+SuspiciousSpawn
+// Injection correlation (timing enforced if capability exists)
+| join kind=leftouter (InjectionEvidence) on DeviceId, $left.LolbinPid == $right.InjectorPid
+| where HasInjectionTelemetry == false or (isnotempty(FirstInjectTime) and FirstInjectTime between (SpawnTime .. SpawnTime + ChainWindow))
+| extend HasInjection = iif(isnotempty(FirstInjectTime), 1, 0)
+
+// Expand target names (best-effort)
+| mv-expand TargetPid = TargetPids to typeof(long) limit 15
+| join kind=leftouter (TargetNameMap) on DeviceId, $left.TargetPid == $right.TargetPid
+| summarize
+    SpawnTime = any(SpawnTime),
+    DeviceName = any(DeviceName),
+    User = any(User),
+    Parent = any(Parent),
+    ParentCmd = any(ParentCmd),
+    Lolbin = any(Lolbin),
+    LolbinCmd = any(LolbinCmd),
+    LolbinPid = any(LolbinPid),
+    FirstInjectTime = any(FirstInjectTime),
+    InjectActions = any(InjectActions),
+    TargetPids = make_set(TargetPid, 15),
+    TargetNames = make_set(TargetName, 15)
+  by DeviceId, LolbinPid
+
+// Target risk: boost if high-value processes are targeted
+| extend HighValueHit = iif(set_intersect(TargetNames, HighValueTargets) != dynamic([]), 1, 0)
+
+// Ghost-load correlation (secondary; timing enforced if capability exists)
+| join kind=leftouter (GhostLoads) on DeviceId, $left.LolbinPid == $right.LoaderPid
+| where HasImageLoadTelemetry == false or (isnotempty(FirstLoadTime) and FirstLoadTime between (SpawnTime .. SpawnTime + ChainWindow))
+| extend HasGhostLoad = iif(isnotempty(FirstLoadTime), 1, 0)
+
+// Beacon correlation (secondary; timing enforced if capability exists)
+| join kind=leftouter (Beacons) on DeviceId, $left.LolbinPid == $right.ProcPid
+| where HasNetworkTelemetry == false or (isnotempty(FirstNetTime) and FirstNetTime between (SpawnTime .. SpawnTime + BeaconWindow))
+| extend HasBeacon = iif(isnotempty(FirstNetTime), 1, 0)
+
+// Beacon risk scoring (contextual)
+| extend BeaconRisk =
+    iif(HasBeacon == 0, 0,
+      1
+      + iif(array_length(Ports) >= 3, 1, 0)
+      + iif(set_intersect(Ports, SuspiciousPorts) != dynamic([]), 2, 0)
+      + iif(array_length(RemoteIPs) >= 3 or array_length(RemoteUrls) >= 3, 1, 0)
+    )
+
+// Base score: abnormal inheritance
+| extend Score_Tree = 5
+
+// Injection-first scoring
+| extend Score_Injection =
+    iif(HasInjectionTelemetry and HasInjection == 1,
+      12 + iif(HighValueHit == 1, 6, 0),
+      0
+    )
+
+// Secondary boosts
+| extend Score_GhostLoad = iif(HasImageLoadTelemetry and HasGhostLoad == 1, 6, 0)
+| extend Score_Beacon = iif(HasNetworkTelemetry and HasBeacon == 1, 4 + BeaconRisk, 0)
+
+| extend RiskScore = Score_Tree + Score_Injection + Score_GhostLoad + Score_Beacon
+
+| extend CapabilityNote = strcat(
+    "Capabilities: Injection=", tostring(HasInjectionTelemetry),
+    " ImageLoad=", tostring(HasImageLoadTelemetry),
+    " Network=", tostring(HasNetworkTelemetry)
+  )
+
+// Severity logic: injection drives CRITICAL, high-value targets elevate urgency
+| extend Severity = case(
+    HasInjectionTelemetry and HasInjection == 1 and HighValueHit == 1, "CRITICAL",
+    HasInjectionTelemetry and HasInjection == 1, "HIGH",
+    (HasImageLoadTelemetry and HasGhostLoad == 1) or (HasNetworkTelemetry and HasBeacon == 1), "MEDIUM",
+    "LOW"
+)
+
+// Dynamic hunter directives (injection-first)
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+      "CRITICAL: Trusted parent -> LOLBin with confirmed injection into high-value target(s). Isolate host. Capture memory. Pivot to target process ancestry + credential access + outbound C2.",
+    Severity == "HIGH",
+      "HIGH: Trusted parent -> LOLBin with confirmed injection/tampering. Identify injected target(s), check for follow-on persistence and C2. Escalate to DFIR if targets include auth/security processes.",
+    Severity == "MEDIUM" and HasGhostLoad == 1,
+      "MEDIUM: Abnormal chain with suspicious unsigned module load (potential reflective/ghost load). Validate module origin, signer, and pivot to net + persistence.",
+    Severity == "MEDIUM" and HasBeacon == 1,
+      "MEDIUM: Abnormal chain with rapid outbound connection. Enrich remote, hunt for payload drops, persistence, and lateral movement.",
+    "LOW: Abnormal parent->LOLBin chain without strong secondary evidence. Validate user intent and baseline frequency."
+)
+
+// Final filter: hunt-safe but focused on injection-first objective
+| where Severity in ("CRITICAL","HIGH","MEDIUM") or RiskScore >= 10
+| project
+    SpawnTime,
+    Severity, RiskScore,
+    CapabilityNote,
+    DeviceName, User,
+    Parent, Lolbin,
+    LolbinCmd, ParentCmd,
+    HasInjection=iff(isnotempty(FirstInjectTime), 1, 0),
+    InjectActions,
+    HighValueHit,
+    TargetNames, TargetPids,
+    HasGhostLoad, LoadCount, SampleLoadedImages, SampleLoadPaths, SampleLoadedSHA1, SampleLoadedSigners,
+    HasBeacon, NetCount, Ports, RemoteIPs, RemoteUrls, Protocols,
+    HunterDirective
+| order by RiskScore desc, SpawnTime desc;
+
+// ============================================================================
+// INCIDENT RESPONSE / REMEDIATION (SOC RUNBOOK)
+// ============================================================================
+//
+// 1) TRIAGE (5–10 min)
+//    - Confirm chain: Trusted parent -> LOLBin -> Injection.
+//    - Validate injected targets (TargetNames) and prioritize if HighValueHit=1.
+//    - Treat missing evidence as visibility gaps if CapabilityNote shows false.
+//
+// 2) CONTAINMENT
+//    - CRITICAL: isolate immediately (high-value injection).
+//    - HIGH: isolate if injection confirmed and user intent is not legitimate admin activity.
+//    - If beaconing confirmed, consider temporary block on RemoteIP/RemoteUrl pending validation.
+//
+// 3) FORENSICS & EVIDENCE
+//    - Memory capture recommended for injection cases (CRITICAL/HIGH).
+//    - Export full process tree around SpawnTime (ParentPid, LolbinPid, targets).
+//    - Collect loaded modules (SampleLoadedSHA1/paths/signers) where available.
+//    - Pull 30–60 minutes network telemetry for follow-on C2 and lateral movement.
+//
+// 4) ERADICATION
+//    - Remove persistence (scheduled tasks, services, Run keys) related to chain.
+//    - Quarantine payloads / scripts if present.
+//    - Reset credentials if targets or follow-on behaviors indicate credential access.
+//
+// 5) RECOVERY
+//    - Reimage if integrity uncertain (repeat injection/tampering, security processes targeted).
+//    - Validate Defender health and telemetry coverage.
+//
+// 6) HARDENING
+//    - ASR/WDAC reduce LOLBin abuse; PowerShell hardening where appropriate.
+//    - Block execution from user-writable paths where feasible.
+//    - Reduce local admin; constrain script interpreters and LOLBin permissions.
+//
+// 7) HUNT EXPANSION
+//    - Pivot fleet-wide on (LolbinCmd patterns, TargetNames, RemoteIPs/Urls, SampleLoadedSHA1).
+// ============================================================================
